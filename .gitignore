@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test output reports (generated at runtime)
+tests/track_a_report.json
+tests/track_a_tables.csv
+tests/track_b_report.json
+
+# Any other runtime-generated reports
+*.report.json
+*_report.json
+*_tables.csv
+
+# Credentials / environment
+.env
+.env.*
+*.pgpass
+pgpass
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/

@@ -1,2 +1,2 @@
-psycopg2-binary>=2.9.0
-rich>=13.0.0
+psycopg2-binary>=2.9.0,<3.0
+rich>=13.0.0,<15.0
