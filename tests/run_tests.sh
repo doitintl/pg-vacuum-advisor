@@ -63,14 +63,17 @@ echo "Step A3: Platform comparison — same data, different scale_factor baselin
 echo ""
 echo "  sc3_near_vac_aurora has 17,100 dead rows in a 100K-row table."
 echo "  The vacuum trigger differs based on the platform flag:"
-echo "    --platform rds    : trigger = 50 + 0.1×100K = 10,050  →  vacuum_pct ≈ 170%  (already past)"
-echo "    --platform aurora : trigger = 50 + 0.2×100K = 20,050  →  vacuum_pct ≈  85%  (near threshold)"
+echo "    --platform rds/aurora : trigger = 50 + 0.1×100K = 10,050  →  vacuum_pct ≈ 170%  (already past)"
+echo "    --platform cloudsql   : trigger = 50 + 0.2×100K = 20,050  →  vacuum_pct ≈  85%  (near threshold)"
 echo ""
-echo "  This test connects to the SAME database but uses Aurora math to prove the"
-echo "  --platform flag correctly changes the trigger calculation, not just the label."
+echo "  NOTE: Aurora and RDS both use scale=0.1 (same AWS parameter group override)."
+echo "  Cloud SQL uses stock PostgreSQL scale=0.2."
+echo ""
+echo "  This test connects to the SAME database but uses different platform math"
+echo "  to prove the --platform flag correctly changes the trigger calculation."
 echo ""
 
-# Run JSON output and extract sc3 vacuum_pct under both platforms to show the numeric difference
+# Run JSON output and extract sc3 vacuum_pct under rds vs cloudsql to show the numeric difference
 RDS_PCT=$(${ADVISOR} -H ${PGHOST:-localhost} -d ${PGDATABASE:-postgres} -U ${PGUSER:-postgres} \
     --platform rds --schema ${SCHEMA} --format json \
     | python3 -c "
@@ -80,8 +83,8 @@ row = next((t for t in tables if t['table'] == 'sc3_near_vac_aurora'), None)
 print(row['vacuum_pct'] if row else 'not found')
 ")
 
-AURORA_PCT=$(${ADVISOR} -H ${PGHOST:-localhost} -d ${PGDATABASE:-postgres} -U ${PGUSER:-postgres} \
-    --platform aurora --schema ${SCHEMA} --format json \
+CLOUDSQL_PCT=$(${ADVISOR} -H ${PGHOST:-localhost} -d ${PGDATABASE:-postgres} -U ${PGUSER:-postgres} \
+    --platform cloudsql --schema ${SCHEMA} --format json \
     | python3 -c "
 import json, sys
 tables = json.load(sys.stdin)['tables']
@@ -90,8 +93,8 @@ print(row['vacuum_pct'] if row else 'not found')
 ")
 
 echo "  sc3_near_vac_aurora vacuum_pct:"
-echo "    --platform rds    : ${RDS_PCT}%   (trigger=10,050)"
-echo "    --platform aurora : ${AURORA_PCT}%    (trigger=20,050)"
+echo "    --platform rds/aurora : ${RDS_PCT}%   (trigger=10,050)"
+echo "    --platform cloudsql   : ${CLOUDSQL_PCT}%    (trigger=20,050)"
 echo ""
 echo "  ✓ Different baselines produce different vacuum_pct for identical data"
 

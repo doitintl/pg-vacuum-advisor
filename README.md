@@ -24,19 +24,22 @@ PostgreSQL documentation says:
 | Platform              | `vacuum_scale_factor` | `analyze_scale_factor` | Source |
 |-----------------------|-----------------------|------------------------|--------|
 | AWS RDS PostgreSQL    | **0.1** (PG 12–18)    | **0.05** (PG 12–18)    | Verified via `aws rds describe-db-parameters` |
-| Aurora PostgreSQL     | 0.2 (engine default)  | 0.1 (engine default)   | Engine default; no parameter group override |
-| Google Cloud SQL      | 0.2 (engine default)  | 0.1 (engine default)   | Engine default |
+| Aurora PostgreSQL     | **0.1**               | **0.05**               | [Aurora parameter group docs](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Reference.ParameterGroups.html) |
+| Google Cloud SQL      | 0.2 (engine default)  | 0.1 (engine default)   | Stock PostgreSQL engine defaults |
 | Stock PostgreSQL      | 0.2                   | 0.1                    | PostgreSQL documentation |
 
-Even with RDS's lower default of 0.1, a large table still accumulates a huge
+Both AWS platforms (RDS and Aurora) apply the same parameter group overrides.
+Google Cloud SQL uses stock PostgreSQL defaults.
+
+Even with the AWS default of 0.1, a large table still accumulates a huge
 number of dead rows before autovacuum fires:
 
-| Table size    | RDS (scale=0.1) trigger | Aurora/Cloud SQL (scale=0.2) trigger |
-|---------------|-------------------------|--------------------------------------|
-| 1 M rows      | 100,050                 | 200,050                              |
-| **10 M rows** | **1,000,050**           | **2,000,050**                        |
-| 100 M rows    | 10,000,050              | 20,000,050                           |
-| 500 M rows    | 50,000,050              | 100,000,050                          |
+| Table size    | AWS RDS/Aurora (scale=0.1) trigger | Cloud SQL (scale=0.2) trigger |
+|---------------|-------------------------------------|-------------------------------|
+| 1 M rows      | 100,050                             | 200,050                       |
+| **10 M rows** | **1,000,050**                       | **2,000,050**                 |
+| 100 M rows    | 10,000,050                          | 20,000,050                    |
+| 500 M rows    | 50,000,050                          | 100,000,050                   |
 
 Those dead rows bloat your tables, slow down sequential scans, waste storage,
 and — left long enough — risk transaction ID wraparound.
@@ -51,7 +54,7 @@ it and generates the SQL, with scale factors **tiered by table size**.
 
 - **Platform-aware defaults** — pass `--platform rds`, `--platform aurora`, or
   `--platform cloudsql` to compare live settings against the correct baseline
-  (RDS uses 0.1/0.05; Aurora and Cloud SQL use PostgreSQL engine defaults)
+  (RDS and Aurora both use 0.1/0.05; Cloud SQL uses stock PostgreSQL defaults 0.2/0.1)
 - **Global settings panel** — every autovacuum parameter with its live value,
   platform default, and a plain-English description; parameters that differ from
   the platform default are highlighted with ★
@@ -108,17 +111,17 @@ PGPASSWORD=secret python3 vacuum_advisor.py -H myhost -d mydb -U postgres --plat
 
 ```bash
 # AWS RDS PostgreSQL (default)
-# Uses RDS parameter group defaults: vacuum_scale=0.1, analyze_scale=0.05
+# AWS parameter group defaults: vacuum_scale=0.1, analyze_scale=0.05
 python3 vacuum_advisor.py -H mydb.abc123.us-east-1.rds.amazonaws.com \
     -d mydb -U postgres --platform rds
 
 # Aurora PostgreSQL
-# Uses engine defaults: vacuum_scale=0.2, analyze_scale=0.1
+# Same AWS parameter group defaults as RDS: vacuum_scale=0.1, analyze_scale=0.05
 python3 vacuum_advisor.py -H cluster.cluster-abc123.us-east-1.rds.amazonaws.com \
     -d mydb -U postgres --platform aurora
 
 # Google Cloud SQL (via Cloud SQL Auth Proxy or public IP)
-# Uses engine defaults: vacuum_scale=0.2, analyze_scale=0.1
+# Stock PostgreSQL defaults: vacuum_scale=0.2, analyze_scale=0.1
 python3 vacuum_advisor.py -H 127.0.0.1 -p 5432 -d mydb -U postgres --platform cloudsql
 ```
 
@@ -175,7 +178,7 @@ python3 vacuum_advisor.py --help
 | `-d DB` | — | Database name |
 | `-U USER` | — | Database user |
 | `-W` | off | Prompt for password interactively |
-| `--platform` | `rds` | `rds` / `aurora` / `cloudsql` — sets the platform default baseline |
+| `--platform` | `rds` | `rds` / `aurora` / `cloudsql` — sets the platform default baseline (`rds` and `aurora` both use 0.1/0.05; `cloudsql` uses 0.2/0.1) |
 | `--schema` | all | Restrict analysis to one schema |
 | `--min-rows N` | 0 | Only report tables with ≥ N live rows |
 | `--top N` | all | Show only top N tables by dead row count |

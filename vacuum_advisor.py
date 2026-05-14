@@ -12,12 +12,12 @@ tables that need per-table tuning.
 Autovacuum fires on a table when:
     dead_rows > vacuum_threshold + (vacuum_scale_factor × live_rows)
 
-Platform default scale_factors (verified via AWS API / GCP docs):
-  AWS RDS PostgreSQL  : vacuum_scale=0.1,  analyze_scale=0.05  (RDS overrides PG defaults)
-  Aurora PostgreSQL   : vacuum_scale=0.2,  analyze_scale=0.1   (engine defaults)
-  Google Cloud SQL    : vacuum_scale=0.2,  analyze_scale=0.1   (engine defaults)
+Platform default scale_factors (verified via AWS API and AWS documentation):
+  AWS RDS PostgreSQL  : vacuum_scale=0.1,  analyze_scale=0.05  (AWS parameter group override)
+  Aurora PostgreSQL   : vacuum_scale=0.1,  analyze_scale=0.05  (same AWS override as RDS)
+  Google Cloud SQL    : vacuum_scale=0.2,  analyze_scale=0.1   (stock PostgreSQL defaults)
 
-With RDS's default scale_factor of 0.1, a 10M-row table still needs 1,000,050
+With the AWS default scale_factor of 0.1, a 10M-row table still needs 1,000,050
 dead rows before autovacuum fires.  This tool shows you that math for every
 table and tells you exactly what to change — with thresholds tiered by table size.
 
@@ -68,20 +68,22 @@ __version__ = "2.1.0"
 console = Console()
 
 # ── Per-Platform Defaults ─────────────────────────────────────────────────────
-# Verified by querying AWS RDS default parameter groups directly via:
-#   aws rds describe-db-parameters --db-parameter-group-name default.postgres<VER>
-# and cross-checked against Google Cloud SQL documentation.
+# Sources:
+#   AWS RDS    : aws rds describe-db-parameters --db-parameter-group-name default.postgres<VER>
+#   Aurora     : https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/
+#                    AuroraPostgreSQL.Reference.ParameterGroups.html
+#   Cloud SQL  : Google Cloud SQL documentation (engine defaults)
 #
-# Key finding: RDS overrides two scale factors vs stock PostgreSQL / Aurora / Cloud SQL:
-#   autovacuum_vacuum_scale_factor : RDS=0.1   (PG stock=0.2, Aurora=0.2, CloudSQL=0.2)
-#   autovacuum_analyze_scale_factor: RDS=0.05  (PG stock=0.1, Aurora=0.1, CloudSQL=0.1)
-# All other autovacuum parameters are at engine defaults across all platforms.
+# Key finding: BOTH RDS and Aurora override the same two scale factors vs stock PostgreSQL:
+#   autovacuum_vacuum_scale_factor : AWS (RDS & Aurora)=0.1   (PG stock=0.2, CloudSQL=0.2)
+#   autovacuum_analyze_scale_factor: AWS (RDS & Aurora)=0.05  (PG stock=0.1, CloudSQL=0.1)
+# Cloud SQL uses stock PostgreSQL engine defaults.
 #
 # Note: autovacuum_vacuum_cost_delay changed from 20 ms → 2 ms in PG 13.
 # Note: maintenance_work_mem on RDS/Aurora is instance-size-dependent:
 #       GREATEST({DBInstanceClassMemory/63963136*1024}, 65536) — shown as live value.
 
-# Base defaults shared by Aurora and Cloud SQL (stock PostgreSQL engine defaults)
+# Stock PostgreSQL engine defaults (used by Google Cloud SQL)
 _PG_ENGINE_DEFAULTS: Dict[str, str] = {
     "autovacuum":                            "on",
     "autovacuum_vacuum_threshold":           "50",
@@ -98,16 +100,16 @@ _PG_ENGINE_DEFAULTS: Dict[str, str] = {
     "maintenance_work_mem":                  "65536",    # kB = 64 MB (instance-tuned on cloud)
 }
 
-# RDS overrides vacuum and analyze scale factors (confirmed PG 12–18 via AWS API)
-_RDS_OVERRIDES: Dict[str, str] = {
-    "autovacuum_vacuum_scale_factor":  "0.1",   # half of PG default
-    "autovacuum_analyze_scale_factor": "0.05",  # half of PG default
+# AWS overrides — applied to both RDS and Aurora parameter groups
+_AWS_OVERRIDES: Dict[str, str] = {
+    "autovacuum_vacuum_scale_factor":  "0.1",   # half of PG stock default
+    "autovacuum_analyze_scale_factor": "0.05",  # half of PG stock default
 }
 
 PLATFORM_DEFAULTS: Dict[str, Dict[str, str]] = {
-    "rds":      {**_PG_ENGINE_DEFAULTS, **_RDS_OVERRIDES},
-    "aurora":   {**_PG_ENGINE_DEFAULTS},   # engine defaults; rds.adaptive_autovacuum is ON
-    "cloudsql": {**_PG_ENGINE_DEFAULTS},   # engine defaults
+    "rds":      {**_PG_ENGINE_DEFAULTS, **_AWS_OVERRIDES},
+    "aurora":   {**_PG_ENGINE_DEFAULTS, **_AWS_OVERRIDES},  # same AWS overrides as RDS
+    "cloudsql": {**_PG_ENGINE_DEFAULTS},                    # stock PG engine defaults
 }
 
 PLATFORM_LABELS: Dict[str, str] = {
@@ -999,7 +1001,7 @@ examples:
   # AWS RDS (scale_factor default is 0.1, analyze_scale_factor default is 0.05)
   python vacuum_advisor.py -H mydb.abc123.us-east-1.rds.amazonaws.com -d mydb -U postgres --platform rds
 
-  # Aurora PostgreSQL (engine defaults: scale_factor=0.2, analyze_scale_factor=0.1)
+  # Aurora PostgreSQL (same AWS defaults as RDS: scale_factor=0.1, analyze_scale_factor=0.05)
   python vacuum_advisor.py -H cluster.cluster-xxx.us-east-1.rds.amazonaws.com -d mydb -U postgres --platform aurora
 
   # Google Cloud SQL (engine defaults: scale_factor=0.2, analyze_scale_factor=0.1)
@@ -1046,7 +1048,7 @@ examples:
             "Cloud platform (default: rds). Controls which parameter group defaults "
             "are shown in the settings panel and used as the comparison baseline.\n"
             "  rds      – AWS RDS PostgreSQL       (vacuum_scale=0.1,  analyze_scale=0.05)\n"
-            "  aurora   – Aurora PostgreSQL         (vacuum_scale=0.2,  analyze_scale=0.1)\n"
+            "  aurora   – Aurora PostgreSQL         (vacuum_scale=0.1,  analyze_scale=0.05)\n"
             "  cloudsql – Google Cloud SQL          (vacuum_scale=0.2,  analyze_scale=0.1)"
         ),
     )
