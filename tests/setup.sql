@@ -12,11 +12,12 @@
 --       --platform rds --schema vac_test
 --
 -- Dead-tuple counts are calculated precisely per platform:
---   RDS      vacuum trigger = 50 + (0.10 × live_rows)
---   RDS      analyze trigger = 50 + (0.05 × live_rows)
---   Aurora   vacuum trigger = 50 + (0.20 × live_rows)
---   Aurora   analyze trigger = 50 + (0.10 × live_rows)
---   Cloud SQL = same as Aurora
+--   RDS      vacuum trigger  = 50 + (0.10 × live_rows)   ─┐ Both AWS platforms use
+--   RDS      analyze trigger = 50 + (0.05 × live_rows)    │ the same overrides per
+--   Aurora   vacuum trigger  = 50 + (0.10 × live_rows)   ─┤ their parameter groups
+--   Aurora   analyze trigger = 50 + (0.05 × live_rows)   ─┘
+--   Cloud SQL vacuum trigger  = 50 + (0.20 × live_rows)  ─┐ Cloud SQL uses stock
+--   Cloud SQL analyze trigger = 50 + (0.10 × live_rows)  ─┘ PostgreSQL defaults
 -- =============================================================================
 
 \set ON_ERROR_STOP on
@@ -98,21 +99,21 @@ UPDATE vac_test.sc2_near_vac_rds
 
 
 -- ---------------------------------------------------------------------------
--- Scenario 3 — NEAR VACUUM TRIGGER  (Aurora / Cloud SQL defaults)
+-- Scenario 3 — NEAR VACUUM TRIGGER  (Cloud SQL defaults)
 -- ---------------------------------------------------------------------------
--- Expected status : 🚫 DISABLED  +  ⚡ NEAR VAC  (with --platform aurora/cloudsql)
--- Platform        : Aurora / Cloud SQL  (vacuum_scale_factor = 0.2)
+-- Expected status : 🚫 DISABLED  +  ⚡ NEAR VAC  (with --platform cloudsql)
+-- Platform        : Cloud SQL  (vacuum_scale_factor = 0.2, stock PG default)
 -- Vacuum trigger  : 50 + 0.2 × 100,000 = 20,050 dead rows
 -- Dead rows built : 17,100  →  17,100 / 20,050 = 85.3% to trigger
 -- dead_pct        : 17,100 / 117,100 = 14.6%  (not HIGH BLOAT)
 --
--- NOTE: Run with --platform aurora or --platform cloudsql to see NEAR VAC.
---       With --platform rds (scale=0.1, trigger=10,050) it will show NEAR VAC too
---       since 17,100 > 10,050 (170% to trigger → already past threshold).
+-- NOTE: Aurora and RDS both use scale=0.1 (trigger=10,050), so with
+--       --platform aurora or --platform rds this table shows 170% (past threshold).
+--       Only --platform cloudsql (scale=0.2) shows it at 85% (NEAR VAC).
 -- autovacuum left disabled — same reason as sc1.
 -- ---------------------------------------------------------------------------
 \echo ''
-\echo '► Scenario 3: NEAR VAC TRIGGER — Aurora/Cloud SQL  (scale=0.2, target 85%)'
+\echo '► Scenario 3: NEAR VAC TRIGGER — Cloud SQL  (scale=0.2, target 85%)'
 
 CREATE TABLE vac_test.sc3_near_vac_aurora (
     id      SERIAL PRIMARY KEY,
