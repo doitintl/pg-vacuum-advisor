@@ -124,11 +124,17 @@ _platform_defaults: Dict[str, str] = _PG_ENGINE_DEFAULTS  # overwritten at start
 # ── Thresholds ─────────────────────────────────────────────────────────────────
 HIGH_DEAD_PCT          = 20.0         # Dead-tuple % considered high bloat
 NEAR_TRIGGER_PCT       = 80.0         # % of trigger threshold = "near trigger" warning
-# Remaining transactions until the forced anti-wraparound vacuum kicks in
-# (freeze_max_age - xid_age).  These thresholds are intentionally well inside
-# the freeze window so you get advance warning.
-XID_WARNING_REMAINING  = 50_000_000   # < 50 M remaining → warn
-XID_CRITICAL_REMAINING = 10_000_000   # < 10 M remaining → critical
+# Tables below this size are omitted from the health display — autovacuum handles
+# small tables well by default (trigger fires after ~5-10% of rows, not millions).
+# Exception: tables with autovacuum explicitly disabled are always shown.
+HEALTH_MIN_BYTES       = 50 * 1024 * 1024   # 50 MB
+# Remaining transactions until autovacuum_freeze_max_age (the SOFT limit) is hit.
+# freeze_max_age is NOT the wraparound point — the hard limit is 2^31 (~2.1 B).
+# Once xid_age exceeds freeze_max_age, PostgreSQL's anti-wraparound autovacuum
+# is already firing aggressively on affected tables.  These thresholds warn that
+# the soft window is nearly exhausted, which means autovacuum may be lagging.
+XID_WARNING_REMAINING  = 50_000_000   # < 50 M remaining until freeze_max_age → warn
+XID_CRITICAL_REMAINING = 10_000_000   # < 10 M remaining until freeze_max_age → critical
 
 # Tiered recommended vacuum scale_factor by live row count (cloud-tuned).
 # Each entry: (min_live_rows, recommended_scale_factor, tier_label)
@@ -623,36 +629,60 @@ def show_settings(report: AdvisorReport) -> None:
 
 def show_xid_warnings(report: AdvisorReport) -> None:
     """Show XID wraparound warnings for ALL databases, not just the current one."""
-    for xid in report.xid_rows:
-        remaining = int(xid["freeze_max_age"]) - int(xid["xid_age"])
+    alerts = [
+        (xid, int(xid["freeze_max_age"]) - int(xid["xid_age"]))
+        for xid in report.xid_rows
+        if int(xid["freeze_max_age"]) - int(xid["xid_age"]) < XID_WARNING_REMAINING
+    ]
+    if not alerts:
+        return
+
+    # Print the context note once — not repeated per database
+    console.print()
+    console.print(Panel(
+        "[dim]PostgreSQL must freeze old transaction IDs to prevent wraparound failure.\n"
+        "autovacuum_freeze_max_age is a [bold]soft limit[/bold] — once a database's XID age\n"
+        "crosses it, anti-wraparound autovacuum runs aggressively to catch up.\n"
+        "The closer to this limit, the more expensive VACUUM becomes: it must freeze\n"
+        "more rows, takes longer, and holds a SHARE UPDATE EXCLUSIVE lock that can\n"
+        "block DDL statements and degrade overall performance.\n"
+        "The [bold]hard limit[/bold] (actual wraparound failure) is 2^31 (~2.1 billion transactions).[/dim]",
+        title="[bold yellow]Transaction ID Wraparound — Background[/bold yellow]",
+        expand=False,
+    ))
+
+    for xid, remaining in alerts:
         tag = " [dim](current database)[/dim]" if xid["datname"] == report.current_db else ""
+        pct_used = int(xid["xid_age"]) / int(xid["freeze_max_age"]) * 100
 
         if remaining < XID_CRITICAL_REMAINING:
             console.print()
             console.print(Panel(
-                f"[bold red]🚨 CRITICAL — XID Wraparound Risk[/bold red]\n\n"
-                f"  Database      : {xid['datname']}{tag}\n"
-                f"  XID age       : {fmt_num(xid['xid_age'])}\n"
-                f"  Freeze max age: {fmt_num(xid['freeze_max_age'])}\n"
-                f"  Remaining     : [bold red]{fmt_num(remaining)} transactions[/bold red]\n\n"
-                "  ► Run VACUUM FREEZE ANALYZE on heavily-updated tables immediately.\n"
-                "  ► If autovacuum is disabled on any table, re-enable it now.\n"
-                "  ► AWS RDS    : check Enhanced Monitoring → autovacuum worker activity.\n"
-                "  ► Cloud SQL  : check System Insights → 'PostgreSQL autovacuum' metric.",
-                title="[bold red]Transaction ID Wraparound[/bold red]",
+                f"[bold red]🚨 Anti-Wraparound Autovacuum Is Behind Schedule[/bold red]\n\n"
+                f"  Database       : {xid['datname']}{tag}\n"
+                f"  XID age        : {fmt_num(xid['xid_age'])} ({pct_used:.1f}% of soft limit)\n"
+                f"  Freeze max age : {fmt_num(xid['freeze_max_age'])}\n"
+                f"  Remaining      : [bold red]{fmt_num(remaining)} transactions[/bold red] until soft limit\n\n"
+                "  ► Confirm anti-wraparound autovacuum is actively running on this database.\n"
+                "  ► Check pg_stat_activity for autovacuum workers on high-write tables.\n"
+                "  ► If autovacuum is disabled on any table, re-enable it immediately.\n"
+                "  ► AWS RDS   : check Enhanced Monitoring → autovacuum worker activity.\n"
+                "  ► Cloud SQL : check System Insights → 'PostgreSQL autovacuum' metric.",
+                title="[bold red]XID Wraparound Warning — CRITICAL[/bold red]",
                 expand=False,
             ))
-        elif remaining < XID_WARNING_REMAINING:
+        else:
             console.print()
             console.print(Panel(
-                f"[bold yellow]⚠  XID Wraparound Approaching[/bold yellow]\n\n"
-                f"  Database : {xid['datname']}{tag}\n"
-                f"  XID age  : {fmt_num(xid['xid_age'])}\n"
-                f"  Remaining: [yellow]{fmt_num(remaining)} transactions[/yellow]\n\n"
-                "  Monitor closely — ensure autovacuum is keeping up on high-write tables.\n"
+                f"[bold yellow]⚠  XID Age Approaching Soft Freeze Limit[/bold yellow]\n\n"
+                f"  Database       : {xid['datname']}{tag}\n"
+                f"  XID age        : {fmt_num(xid['xid_age'])} ({pct_used:.1f}% of soft limit)\n"
+                f"  Freeze max age : {fmt_num(xid['freeze_max_age'])}\n"
+                f"  Remaining      : [yellow]{fmt_num(remaining)} transactions[/yellow] until soft limit\n\n"
+                "  ► Monitor that autovacuum is keeping up on high-write tables.\n"
                 "  ► AWS RDS   : confirm autovacuum_freeze_max_age in your parameter group.\n"
                 "  ► Cloud SQL : use pg_stat_user_tables.n_dead_tup to track progress.",
-                title="[yellow]Transaction ID Wraparound Warning[/yellow]",
+                title="[yellow]XID Wraparound Warning[/yellow]",
                 expand=False,
             ))
 
@@ -697,8 +727,17 @@ def show_disabled_tables(report: AdvisorReport) -> None:
 
 
 def show_table_health(report: AdvisorReport, top: Optional[int] = None) -> None:
-    tables = report.tables[:top] if top else report.tables
-    title  = "📊  Table Vacuum & Analyze Health"
+    # Exclude temp tables — autovacuum doesn't run on them; they have their own section
+    non_temp = [t for t in report.tables if not t.schema.startswith("pg_temp_")]
+
+    # Omit small tables from display — autovacuum handles them well with default settings.
+    # Always keep tables with autovacuum disabled regardless of size (wraparound risk).
+    tables    = [t for t in non_temp if t.size_bytes >= HEALTH_MIN_BYTES or not t.autovacuum_enabled]
+    omitted   = len(non_temp) - len(tables)
+
+    tables = tables[:top] if top else tables
+
+    title = "📊  Table Vacuum & Analyze Health"
     if top:
         title += f"  [dim](top {top} by dead rows)[/dim]"
 
@@ -706,27 +745,24 @@ def show_table_health(report: AdvisorReport, top: Optional[int] = None) -> None:
     console.print(Panel(f"[bold cyan]{title}[/bold cyan]", expand=False))
 
     t = Table(box=box.SIMPLE_HEAD, header_style="bold magenta", padding=(0, 1))
-    t.add_column("Schema.Table",    style="cyan", no_wrap=True, max_width=45)
-    t.add_column("Size",            justify="right")
-    t.add_column("Live Rows",       justify="right")
-    t.add_column("Dead Rows",       justify="right")
-    t.add_column("Dead %",          justify="right")
+    t.add_column("Schema.Table",      style="cyan", no_wrap=True, max_width=45)
+    t.add_column("Size",              justify="right")
+    t.add_column("Live Rows",         justify="right")
+    t.add_column("Dead Rows",         justify="right")
+    t.add_column("Dead %",            justify="right")
     t.add_column("Vac Trigger\n[dim](dead rows)[/dim]", justify="right")
-    t.add_column("% to Vac",        justify="right")
-    t.add_column("Mod Since\n[dim]Analyze[/dim]",      justify="right")
-    t.add_column("% to Ana",        justify="right")
-    t.add_column("Last Autovacuum", justify="right")
-    t.add_column("Status",          justify="left")
+    t.add_column("% to Vac",          justify="right")
+    t.add_column("% to Ana",          justify="right")
+    t.add_column("Last Autovacuum",   justify="right")
+    t.add_column("Last Autoanalyze",  justify="right")
+    t.add_column("Status",            justify="left")
+
+    def fmt_date(dt: Optional[datetime], has_rows: bool) -> str:
+        if dt:
+            return dt.strftime("%Y-%m-%d")
+        return "[red]Never[/red]" if has_rows else "—"
 
     for th in tables:
-        last_av = th.last_autovacuum
-        if last_av:
-            last_av_str = last_av.strftime("%Y-%m-%d %H:%M")
-        elif th.n_live > 0:
-            last_av_str = "[red]Never[/red]"
-        else:
-            last_av_str = "—"
-
         label = f"{th.schema}.{th.table}"
         if th.has_vacuum_override or th.has_analyze_override:
             label += " [dim]†[/dim]"
@@ -755,9 +791,9 @@ def show_table_health(report: AdvisorReport, top: Optional[int] = None) -> None:
             dead_pct_str,
             fmt_num(th.vacuum_trigger),
             v_pct_str,
-            fmt_num(th.n_mod_since_analyze),
             a_pct_str,
-            last_av_str,
+            fmt_date(th.last_autovacuum,  th.n_live > 0),
+            fmt_date(th.last_autoanalyze, th.n_live > 0),
             _status_rich(th.statuses),
         )
 
@@ -767,6 +803,11 @@ def show_table_health(report: AdvisorReport, top: Optional[int] = None) -> None:
         "  [dim]% to Vac / % to Ana  =  current dead/modified rows as % of the "
         "trigger threshold (≥80% → warning)[/dim]"
     )
+    if omitted:
+        console.print(
+            f"  [dim]{omitted} table(s) < 50 MB omitted — autovacuum handles small tables "
+            "well with default settings.  Use --min-rows to filter at collection time.[/dim]"
+        )
 
 
 def show_recommendations(report: AdvisorReport) -> None:
@@ -979,6 +1020,92 @@ def output_csv(report: AdvisorReport, output_file: Optional[str]) -> None:
         print(out)
 
 
+# ── Replay from JSON ──────────────────────────────────────────────────────────
+def load_report_from_json(path: str) -> AdvisorReport:
+    """Reconstruct an AdvisorReport from a JSON file produced by --format json."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        console.print(f"[bold red]File not found:[/bold red] {path}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        console.print(f"[bold red]Invalid JSON:[/bold red] {e}")
+        sys.exit(1)
+
+    tables: List[TableHealth] = []
+    for t in data["tables"]:
+        last_av = last_ana = None
+        if t.get("last_autovacuum") and t["last_autovacuum"] not in (None, "Never"):
+            try:
+                last_av = datetime.fromisoformat(t["last_autovacuum"])
+            except (ValueError, TypeError):
+                pass
+        if t.get("last_autoanalyze") and t["last_autoanalyze"] not in (None, "Never"):
+            try:
+                last_ana = datetime.fromisoformat(t["last_autoanalyze"])
+            except (ValueError, TypeError):
+                pass
+        tables.append(TableHealth(
+            schema=t["schema"],
+            table=t["table"],
+            n_live=t["n_live"],
+            n_dead=t["n_dead"],
+            dead_pct=t["dead_pct"],
+            size_bytes=t["size_bytes"],
+            last_autovacuum=last_av,
+            last_autoanalyze=last_ana,
+            n_mod_since_analyze=t["n_mod_since_analyze"],
+            vacuum_trigger=t["vacuum_trigger"],
+            vacuum_pct=t["vacuum_pct"],
+            analyze_trigger=t["analyze_trigger"],
+            analyze_pct=t["analyze_pct"],
+            has_vacuum_override=t["has_vacuum_override"],
+            has_analyze_override=t["has_analyze_override"],
+            autovacuum_enabled=t["autovacuum_enabled"],
+            vac_scale=0.0,      # not stored in JSON; unused in display
+            vac_threshold=0.0,
+            ana_scale=0.0,
+            ana_threshold=0.0,
+            statuses=t["statuses"],
+        ))
+
+    recs: List[Recommendation] = []
+    for r in data.get("recommendations", []):
+        recs.append(Recommendation(
+            schema=r["schema"],
+            table=r["table"],
+            n_live=r["n_live"],
+            size_bytes=r["size_bytes"],
+            tier_label=r["tier_label"],
+            cur_vac_scale=r["cur_vac_scale"],
+            cur_vac_threshold=r["cur_vac_threshold"],
+            cur_vac_trigger=r["cur_vac_trigger"],
+            new_vac_scale=r["new_vac_scale"],
+            new_vac_threshold=r["new_vac_threshold"],
+            new_vac_trigger=r["new_vac_trigger"],
+            needs_vacuum=r["needs_vacuum"],
+            cur_ana_scale=r["cur_ana_scale"],
+            cur_ana_threshold=r["cur_ana_threshold"],
+            new_ana_scale=r["new_ana_scale"],
+            new_ana_threshold=r["new_ana_threshold"],
+            needs_analyze=r["needs_analyze"],
+        ))
+
+    return AdvisorReport(
+        pg_version=data["pg_version"],
+        platform=data["platform"],
+        platform_label=data["platform_label"],
+        platform_defaults=data["platform_defaults"],
+        settings=data["settings"],
+        tables=tables,
+        recommendations=recs,
+        xid_rows=data["xid_data"],
+        generated_at=data["generated_at"],
+        current_db="",  # not stored in JSON; "(current database)" tag will be omitted
+    )
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser(
@@ -998,6 +1125,9 @@ examples:
   python vacuum_advisor.py -H myhost -d mydb -U postgres --format json --output report.json
   python vacuum_advisor.py -H myhost -d mydb -U postgres --format csv  --output tables.csv
 
+  # Re-render console output from a JSON file (no database connection needed)
+  python vacuum_advisor.py --replay report.json
+
   # AWS RDS (scale_factor default is 0.1, analyze_scale_factor default is 0.05)
   python vacuum_advisor.py -H mydb.abc123.us-east-1.rds.amazonaws.com -d mydb -U postgres --platform rds
 
@@ -1013,7 +1143,12 @@ examples:
         version=f"pg-vacuum-advisor {__version__}",
     )
 
-    conn_grp = ap.add_mutually_exclusive_group(required=True)
+    ap.add_argument(
+        "--replay", metavar="JSON_FILE",
+        help="Re-render console output from a JSON report file (no database connection needed)",
+    )
+
+    conn_grp = ap.add_mutually_exclusive_group(required=False)
     conn_grp.add_argument(
         "--conn", metavar="DSN",
         help="Full libpq DSN: postgresql://user:pass@host:5432/dbname",
@@ -1062,6 +1197,18 @@ examples:
     )
 
     args = ap.parse_args()
+    global _platform_defaults
+
+    # ── Replay mode: re-render console output from a JSON file ────────────────
+    if args.replay:
+        report = load_report_from_json(args.replay)
+        _platform_defaults = PLATFORM_DEFAULTS.get(report.platform, _PG_ENGINE_DEFAULTS)
+        render_console(report, top=args.top)
+        return
+
+    # ── Require connection info when not in replay mode ───────────────────────
+    if not args.conn and not args.host:
+        ap.error("one of --conn / -H is required (or use --replay to render from a JSON file)")
 
     # ── Build connection string ────────────────────────────────────────────────
     if args.conn:
@@ -1086,7 +1233,6 @@ examples:
         conn_string = " ".join(parts)
 
     # ── Set platform defaults (used by effective() fallback) ───────────────────
-    global _platform_defaults
     _platform_defaults = PLATFORM_DEFAULTS.get(args.platform, _PG_ENGINE_DEFAULTS)
 
     # ── Fetch → Analyse → Output ───────────────────────────────────────────────
