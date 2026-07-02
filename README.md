@@ -59,16 +59,26 @@ it and generates the SQL, with scale factors **tiered by table size**.
   platform default, and a plain-English description; parameters that differ from
   the platform default are highlighted with ★
 - **Vacuum + Analyze health table** — live rows, dead rows, dead %, vacuum trigger
-  threshold, % to vacuum trigger, modified-since-analyze count, % to analyze
-  trigger, last autovacuum timestamp, and combined status
+  threshold, % to vacuum trigger, % to analyze trigger, last autovacuum date,
+  last autoanalyze date, and combined status; tables under 50 MB are omitted
+  (autovacuum handles them well with defaults); tables with autovacuum disabled
+  are always shown regardless of size
 - **Multi-status indicators** — a table can carry multiple flags simultaneously:
   `🚫 DISABLED`, `⚠ HIGH BLOAT`, `⚡ NEAR VAC`, `📈 NEAR ANA`, `✓ OK`
 - **Tiered ALTER TABLE recommendations** — scale factors sized to table row count,
   covering both vacuum and analyze tuning in a single statement
 - **`autovacuum_enabled=false` detection** — critical warning panel with the exact
   `RESET` SQL for each disabled table
-- **XID wraparound check** — scans all databases (not just the current one), with
-  RDS- and Cloud SQL-specific remediation guidance
+- **XID wraparound check** — scans all databases (not just the current one);
+  background context printed once with performance impact explanation (SHARE UPDATE
+  EXCLUSIVE lock, freeze cost); each database gets a CRITICAL or WARNING panel with
+  its % of soft limit shown inline
+- **`--replay JSON_FILE`** — re-render the full console output from a saved JSON
+  report with no database connection required; useful for reviewing what a customer
+  saw or sharing analysis with teammates
+- **`json_to_report.py`** — companion script that converts a JSON report to a
+  human-readable Markdown file; useful when you can't see the customer's console
+  output but they can share the JSON file
 - **`--format json|csv`** — structured output for scripting, CI pipelines, and
   monitoring; JSON includes the complete `ALTER TABLE` SQL for each recommendation
 - **`--top N`** — show only the N worst tables by dead row count
@@ -156,6 +166,31 @@ python3 vacuum_advisor.py -H myhost -d mydb -U postgres --platform rds \
 python3 vacuum_advisor.py -H myhost -d mydb -U postgres --platform rds --format json
 ```
 
+### Replaying a report (no database connection needed)
+
+If a customer shares their JSON report file, you can re-render the full
+console output exactly as they would have seen it:
+
+```bash
+python3 vacuum_advisor.py --replay report.json
+```
+
+### Converting JSON to Markdown
+
+For sharing or filing in tickets, convert the JSON to a human-readable Markdown report:
+
+```bash
+# Print to stdout
+python3 json_to_report.py report.json
+
+# Write to file
+python3 json_to_report.py report.json report.md
+```
+
+The Markdown report includes XID severity flags, table statistics grouped by size
+(Large >1 GB, Medium 50 MB–1 GB), per-table tuning recommendations with SQL, and
+a summary. Tables under 50 MB are omitted from the stats section.
+
 ### Other flags
 
 ```bash
@@ -184,6 +219,7 @@ python3 vacuum_advisor.py --help
 | `--top N` | all | Show only top N tables by dead row count |
 | `--format` | `console` | `console` / `json` / `csv` |
 | `--output FILE` | stdout | Write json/csv output to a file |
+| `--replay FILE` | — | Re-render console output from a JSON report (no DB connection needed) |
 | `--version` | — | Print version and exit |
 
 ---
@@ -261,26 +297,27 @@ parameter. Includes the exact `RESET` SQL to re-enable each table.
 
 ### 4 — Table Vacuum & Analyze Health
 
-One row per table. Columns show the current dead-row count, how far it is from
-the vacuum trigger (% to Vac), the modified-row count relative to the analyze
-trigger (% to Ana), and a combined status.
+One row per table (50 MB+ only; always includes autovacuum-disabled tables).
+Columns show dead-row count, how far from the vacuum trigger (% to Vac), how far
+from the analyze trigger (% to Ana), last autovacuum and autoanalyze dates, and
+a combined status flag.
 
 ```
 ╭───────────────────────────────────╮
 │ 📊  Table Vacuum & Analyze Health │
 ╰───────────────────────────────────╯
 
-                                               Vac Trigger               Mod Since    % to    Last
-  Schema.Table              Size    Live Rows  (dead rows)  % to Vac     Analyze       Ana   Autovac   Status
-  ──────────────────────────────────────────────────────────────────────────────────────────────────────────
-  public.orders           2.3 GB    8,500,000    850,050       91%       420,000       100%   2026-05   ⚡ NEAR VAC
-                                                                                                         📈 NEAR ANA
-  public.events †       189.0 MB    2,000,000    200,050        0%             0         0%   2026-05   ✓ OK
-  public.archived_logs   56.7 MB      500,000     50,050      200%       600,000      999%      Never   🚫 DISABLED
-  public.users            9.9 MB      100,000     10,050       43%         4,300        85%      Never   🚫 DISABLED
+                                               Vac Trigger   % to   % to   Last          Last
+  Schema.Table              Size    Live Rows  (dead rows)    Vac    Ana    Autovacuum    Autoanalyze   Status
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  public.orders           2.3 GB    8,500,000    850,050       91%   100%   2026-05-12    2026-04-01    ⚡ NEAR VAC
+                                                                                                        📈 NEAR ANA
+  public.events †       189.0 MB    2,000,000    200,050        0%     0%   2026-05-10    2026-05-11    ✓ OK
+  public.archived_logs   56.7 MB      500,000     50,050      200%   999%        Never         Never    🚫 DISABLED
 
   † Table has per-table autovacuum storage parameters set
   % to Vac / % to Ana = current dead/modified rows as % of the trigger threshold (≥80% → warning)
+  615 table(s) < 50 MB omitted — autovacuum handles small tables well with default settings.
 ```
 
 **Status flags:**
@@ -332,20 +369,34 @@ thresholds and the responsiveness improvement factor.
 
 ### 6 — XID Wraparound (only shown when relevant)
 
-Shown when any database's XID age is within 50 M transactions of the forced
-anti-wraparound vacuum threshold. Covers all databases in the cluster, not just
-the one you connected to.
+Shown when any database's XID age is within 50 M transactions of `freeze_max_age`
+(the soft limit). Covers all databases in the cluster, not just the one you
+connected to. Background context is printed once, then one panel per affected
+database. `freeze_max_age` is a soft limit — the hard wraparound failure limit is
+2^31 (~2.1 billion). CRITICAL/WARNING means anti-wraparound autovacuum is behind
+schedule, not that the database is about to shut down.
 
 ```
-╭─────────────────────── Transaction ID Wraparound ────────────────────────╮
-│ ⚠  XID Wraparound Approaching                                            │
+╭──────────────── Transaction ID Wraparound — Background ─────────────────╮
+│ PostgreSQL must freeze old transaction IDs to prevent wraparound         │
+│ failure. autovacuum_freeze_max_age is a soft limit — once crossed,       │
+│ anti-wraparound autovacuum runs aggressively to catch up.                │
+│ The closer to this limit, the more expensive VACUUM becomes: it holds    │
+│ a SHARE UPDATE EXCLUSIVE lock that can block DDL and degrade performance.│
+│ The hard limit (actual wraparound failure) is 2^31 (~2.1 billion).       │
+╰─────────────────────────────────────────────────────────────────────────╯
+
+╭──────────────────── XID Wraparound Warning — CRITICAL ──────────────────╮
+│ 🚨 Anti-Wraparound Autovacuum Is Behind Schedule                         │
 │                                                                          │
-│   Database : mydb (current database)                                     │
-│   XID age  : 155,000,000                                                 │
-│   Remaining: 45,000,000 transactions                                     │
+│   Database       : mydb (current database)                               │
+│   XID age        : 198,500,000 (99.3% of soft limit)                    │
+│   Freeze max age : 200,000,000                                           │
+│   Remaining      : 1,500,000 transactions until soft limit               │
 │                                                                          │
-│   Monitor closely — ensure autovacuum is keeping up on high-write tables │
-╰──────────────────────────────────────────────────────────────────────────╯
+│   ► Confirm anti-wraparound autovacuum is actively running.              │
+│   ► Check pg_stat_activity for autovacuum workers on high-write tables.  │
+╰─────────────────────────────────────────────────────────────────────────╯
 ```
 
 ### 7 — Summary
