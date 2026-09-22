@@ -250,6 +250,10 @@ def generate_report(data):
     report.append("")
     report.append("- **OK**: No issues detected")
     report.append("- **HIGH_BLOAT**: Dead tuple percentage ≥ 20%")
+    report.append("- **HIGH_BLOAT_ABSOLUTE**: Absolute dead-row count or estimated dead bytes is high "
+                   "(≥1M dead rows or ≥1GB estimated dead bytes), regardless of dead-tuple percentage — "
+                   "catches large tables whose bloat percentage looks modest but whose absolute volume "
+                   "still drives I/O")
     report.append("- **NEAR_VACUUM_TRIGGER**: Dead rows ≥ 80% of vacuum trigger threshold")
     report.append("- **NEAR_ANALYZE_TRIGGER**: Modified rows ≥ 80% of analyze trigger threshold")
     report.append("")
@@ -263,6 +267,7 @@ def generate_report(data):
     report.append(f"- Total tables analyzed: {summary.get('total_tables', len(data['tables']))}")
     report.append(f"- Autovacuum disabled: {summary.get('autovacuum_disabled', 'N/A')}")
     report.append(f"- High bloat (≥20% dead): {summary.get('high_bloat', 'N/A')}")
+    report.append(f"- High bloat (absolute — ≥1M dead rows or ≥1GB est. dead bytes): {summary.get('high_bloat_absolute', 'N/A')}")
     report.append(f"- Never autovacuumed: {summary.get('never_autovacuumed', 'N/A')}")
     report.append(f"- Need per-table tuning: {summary.get('need_tuning', 'N/A')}")
     report.append("")

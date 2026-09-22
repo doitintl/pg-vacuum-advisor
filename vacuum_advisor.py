@@ -118,11 +118,31 @@ PLATFORM_LABELS: Dict[str, str] = {
     "cloudsql": "Google Cloud SQL",
 }
 
+# Platform-internal admin databases that --all-databases should skip by default.
+# Unlike template0/template1 (datistemplate=true, already excluded by
+# SQL_LIST_DATABASES), these are ordinary, connectable, non-template databases
+# the cloud provider creates for its own management use — nothing a customer
+# runs vacuum tuning against. --exclude-db can still add more on top of these.
+PLATFORM_INTERNAL_DATABASES: Dict[str, List[str]] = {
+    "rds":      ["rdsadmin"],
+    "aurora":   ["rdsadmin"],
+    "cloudsql": ["cloudsqladmin"],
+}
+
 # Convenience alias used throughout — set in main() based on --platform flag
 _platform_defaults: Dict[str, str] = _PG_ENGINE_DEFAULTS  # overwritten at startup
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
 HIGH_DEAD_PCT          = 20.0         # Dead-tuple % considered high bloat
+# Percentage-based bloat (HIGH_DEAD_PCT) misses large tables whose dead-tuple
+# percentage is modest but whose absolute dead-row count / dead-byte volume is
+# still what actually drives I/O and disk usage (e.g. an 844 GB table at 10.76%
+# dead — 34M dead tuples — sits under the 20% threshold yet dwarfs 130 flagged
+# tables under it combined).  These two absolute thresholds catch that case
+# without touching the existing percentage flag, so both dimensions are
+# reported side by side.
+HIGH_DEAD_ROWS_ABS     = 1_000_000          # ≥ 1 M dead rows, regardless of %
+HIGH_DEAD_BYTES_ABS     = 1 * 1024 ** 3     # ≥ 1 GB estimated dead bytes, regardless of %
 NEAR_TRIGGER_PCT       = 80.0         # % of trigger threshold = "near trigger" warning
 # Tables below this size are omitted from the health display — autovacuum handles
 # small tables well by default (trigger fires after ~5-10% of rows, not millions).
@@ -208,6 +228,19 @@ SQL_XID = """
 
 SQL_VERSION = "SELECT version();"
 
+# pg_stat_user_tables / pg_class are database-scoped catalogs — a connection to
+# one database cannot see another database's tables.  --all-databases works
+# around that by connecting first to a bootstrap database (default: postgres)
+# just to enumerate the real, connectable databases, then reconnecting once
+# per database to run SQL_TABLES against each in turn.
+SQL_LIST_DATABASES = """
+    SELECT datname
+    FROM   pg_database
+    WHERE  datistemplate = false
+    AND    datallowconn  = true
+    ORDER BY datname;
+"""
+
 # ── Data Classes ───────────────────────────────────────────────────────────────
 @dataclass
 class TableHealth:
@@ -217,6 +250,7 @@ class TableHealth:
     n_dead:               int
     dead_pct:             float
     size_bytes:           int
+    estimated_dead_bytes: int   # size_bytes * dead_pct — absolute-bloat estimate
     last_autovacuum:      Optional[datetime]
     last_autoanalyze:     Optional[datetime]
     n_mod_since_analyze:  int
@@ -329,9 +363,35 @@ def tier_label(n_live: int) -> str:
     return "> 1 M rows"
 
 
+def quote_ident(identifier: str) -> str:
+    """Quote a PostgreSQL identifier per quote_ident() semantics.
+
+    Mirrors what the server-side quote_ident() function guarantees: the
+    identifier is always safe to use verbatim in generated SQL, regardless
+    of case, reserved-word status, or embedded characters.  We always wrap
+    in double quotes (unconditional quoting is always valid PostgreSQL
+    syntax — it just disables case-folding) and escape any embedded double
+    quote by doubling it, exactly as the server does.  This is deliberately
+    NOT a naive `f'"{identifier}"'` wrap: that form breaks the moment the
+    identifier itself contains a `"` character (e.g. a table literally
+    named `foo"bar`), producing invalid/injectable SQL.
+
+    Without this, unquoted mixed-case or reserved-word identifiers (very
+    common with ORMs like EF Core or Hibernate, e.g. `CollectedEntitiesMetadata`)
+    get folded to lowercase by PostgreSQL and the generated statement fails
+    with `relation "..." does not exist`.
+    """
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def qualify_ident(schema: str, table: str) -> str:
+    """Build a fully-qualified, properly quoted `schema.table` identifier."""
+    return f"{quote_ident(schema)}.{quote_ident(table)}"
+
+
 def build_alter_sql(rec: Recommendation) -> str:
     """Generate the ALTER TABLE statement for a recommendation."""
-    fqtn   = f"{rec.schema}.{rec.table}"
+    fqtn   = qualify_ident(rec.schema, rec.table)
     params = []
     if rec.needs_vacuum:
         params.append(f"    autovacuum_vacuum_scale_factor  = {rec.new_vac_scale}")
@@ -407,6 +467,32 @@ def fetch_data(
     return gsettings, rows, xid_rows, pg_version, current_db
 
 
+def list_target_databases(bootstrap_conn_string: str, exclude: Optional[set] = None) -> List[str]:
+    """Enumerate real, connectable databases on the instance for --all-databases.
+
+    Connects once to a bootstrap database (typically 'postgres') purely to
+    read pg_database, which — unlike pg_stat_user_tables — is cluster-wide.
+    Template databases and anything in `exclude` (e.g. 'rdsadmin') are skipped.
+    """
+    exclude = exclude or set()
+    try:
+        conn = psycopg2.connect(bootstrap_conn_string)
+        conn.set_session(readonly=True, autocommit=True)
+        cur = conn.cursor()
+        cur.execute(SQL_LIST_DATABASES)
+        names = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+    except psycopg2.OperationalError as e:
+        console.print(f"\n[bold red]Could not connect to bootstrap database:[/bold red] {e}")
+        sys.exit(1)
+    except psycopg2.Error as e:
+        console.print(f"\n[bold red]Database error while listing databases:[/bold red] {e}")
+        sys.exit(1)
+
+    return [n for n in names if n not in exclude]
+
+
 # ── Analysis ───────────────────────────────────────────────────────────────────
 def analyze_table_row(row: Dict, gsettings: Dict[str, str]) -> TableHealth:
     """Compute full health metrics for a single table row."""
@@ -415,6 +501,12 @@ def analyze_table_row(row: Dict, gsettings: Dict[str, str]) -> TableHealth:
     n_dead  = int(row["n_dead_tup"]          or 0)
     n_mod   = int(row["n_mod_since_analyze"] or 0)
     dead_pct = float(row["dead_pct"]         or 0)
+    size_bytes = int(row["total_size_bytes"] or 0)
+    # Estimate: assume dead tuples occupy the same average row density as the
+    # table as a whole, so dead_pct of total_size_bytes approximates dead bytes.
+    # This is an approximation (real per-row size varies, TOAST/index bytes are
+    # included in total_size_bytes) but is good enough to rank absolute impact.
+    estimated_dead_bytes = int(size_bytes * dead_pct / 100.0)
 
     # autovacuum_enabled=false in reloptions disables autovacuum for this table
     av_raw     = relopts.get("autovacuum_enabled", "true").strip().lower()
@@ -437,6 +529,11 @@ def analyze_table_row(row: Dict, gsettings: Dict[str, str]) -> TableHealth:
         statuses.append("DISABLED")
     if dead_pct >= HIGH_DEAD_PCT:
         statuses.append("HIGH_BLOAT")
+    # Absolute dimension — independent of the percentage flag above, so a
+    # large table with modest dead_pct but huge dead-row/dead-byte volume
+    # still gets surfaced (see HIGH_DEAD_ROWS_ABS / HIGH_DEAD_BYTES_ABS comment).
+    if n_dead >= HIGH_DEAD_ROWS_ABS or estimated_dead_bytes >= HIGH_DEAD_BYTES_ABS:
+        statuses.append("HIGH_BLOAT_ABSOLUTE")
     if av_enabled and v_pct >= NEAR_TRIGGER_PCT:
         statuses.append("NEAR_VACUUM_TRIGGER")
     if av_enabled and a_pct >= NEAR_TRIGGER_PCT:
@@ -450,7 +547,8 @@ def analyze_table_row(row: Dict, gsettings: Dict[str, str]) -> TableHealth:
         n_live=n_live,
         n_dead=n_dead,
         dead_pct=dead_pct,
-        size_bytes=int(row["total_size_bytes"] or 0),
+        size_bytes=size_bytes,
+        estimated_dead_bytes=estimated_dead_bytes,
         last_autovacuum=row["last_autovacuum"],
         last_autoanalyze=row["last_autoanalyze"],
         n_mod_since_analyze=n_mod,
@@ -692,6 +790,7 @@ def _status_rich(statuses: List[str]) -> str:
     parts: List[str] = []
     if "DISABLED"             in statuses: parts.append("[bold red]🚫 DISABLED[/bold red]")
     if "HIGH_BLOAT"           in statuses: parts.append("[bold red]⚠ HIGH BLOAT[/bold red]")
+    if "HIGH_BLOAT_ABSOLUTE"  in statuses: parts.append("[bold red]⚠ HIGH BLOAT (ABS)[/bold red]")
     if "NEAR_VACUUM_TRIGGER"  in statuses: parts.append("[bold yellow]⚡ NEAR VAC[/bold yellow]")
     if "NEAR_ANALYZE_TRIGGER" in statuses: parts.append("[bold yellow]📈 NEAR ANA[/bold yellow]")
     if statuses == ["OK"]:                 parts.append("[green]✓ OK[/green]")
@@ -718,7 +817,7 @@ def show_disabled_tables(report: AdvisorReport) -> None:
         "  Unless this was intentional (e.g. a bulk-load staging table), re-enable\n"
         "  autovacuum with:\n\n"
         + "\n".join(
-            f"    ALTER TABLE {t.schema}.{t.table} RESET (autovacuum_enabled);"
+            f"    ALTER TABLE {qualify_ident(t.schema, t.table)} RESET (autovacuum_enabled);"
             for t in disabled
         )
     )
@@ -894,6 +993,7 @@ def show_summary(report: AdvisorReport) -> None:
     total      = len(tables)
     disabled   = sum(1 for t in tables if not t.autovacuum_enabled)
     high_bloat = sum(1 for t in tables if t.dead_pct >= HIGH_DEAD_PCT)
+    high_bloat_abs = sum(1 for t in tables if "HIGH_BLOAT_ABSOLUTE" in t.statuses)
     never_av   = sum(1 for t in tables if not t.last_autovacuum and t.n_live > 0)
     tune_count = len(report.recommendations)
 
@@ -906,6 +1006,8 @@ def show_summary(report: AdvisorReport) -> None:
         f"  Tables analyzed        : {total}\n"
         f"  Autovacuum disabled    : {color(disabled, 'bold red')}\n"
         f"  High bloat (≥{HIGH_DEAD_PCT:.0f}% dead) : {color(high_bloat, 'bold red')}\n"
+        f"  High bloat (absolute)  : {color(high_bloat_abs, 'bold red')}"
+        f"  [dim](≥{fmt_num(HIGH_DEAD_ROWS_ABS)} dead rows or ≥{fmt_bytes(HIGH_DEAD_BYTES_ABS)} est. dead bytes)[/dim]\n"
         f"  Never autovacuumed     : {color(never_av, 'bold red')}\n"
         f"  Need per-table tuning  : {color(tune_count, 'bold yellow')}",
         expand=False,
@@ -931,6 +1033,7 @@ def _table_to_dict(t: TableHealth) -> Dict:
         "n_dead":               t.n_dead,
         "dead_pct":             t.dead_pct,
         "size_bytes":           t.size_bytes,
+        "estimated_dead_bytes": t.estimated_dead_bytes,
         "last_autovacuum":      t.last_autovacuum.isoformat() if t.last_autovacuum else None,
         "last_autoanalyze":     t.last_autoanalyze.isoformat() if t.last_autoanalyze else None,
         "n_mod_since_analyze":  t.n_mod_since_analyze,
@@ -968,8 +1071,15 @@ def _rec_to_dict(r: Recommendation) -> Dict:
     }
 
 
-def output_json(report: AdvisorReport, output_file: Optional[str]) -> None:
-    data = {
+def report_to_dict(report: AdvisorReport) -> Dict:
+    """Convert an AdvisorReport to the plain-dict shape used by --format json.
+
+    Factored out of output_json() so --all-databases can reuse the exact same
+    per-database shape inside its merged {instance, database, report} list —
+    each entry's "report" is byte-for-byte what a single-database run would
+    have produced on its own.
+    """
+    return {
         "generated_at":     report.generated_at,
         "pg_version":       report.pg_version,
         "platform":         report.platform,
@@ -986,10 +1096,15 @@ def output_json(report: AdvisorReport, output_file: Optional[str]) -> None:
             "total_tables":       len(report.tables),
             "autovacuum_disabled":sum(1 for t in report.tables if not t.autovacuum_enabled),
             "high_bloat":         sum(1 for t in report.tables if t.dead_pct >= HIGH_DEAD_PCT),
+            "high_bloat_absolute": sum(1 for t in report.tables if "HIGH_BLOAT_ABSOLUTE" in t.statuses),
             "never_autovacuumed": sum(1 for t in report.tables if not t.last_autovacuum and t.n_live > 0),
             "need_tuning":        len(report.recommendations),
         },
     }
+
+
+def output_json(report: AdvisorReport, output_file: Optional[str]) -> None:
+    data = report_to_dict(report)
     out = json.dumps(data, indent=2, default=str)
     if output_file:
         with open(output_file, "w") as fh:
@@ -1020,12 +1135,65 @@ def output_csv(report: AdvisorReport, output_file: Optional[str]) -> None:
         print(out)
 
 
+# ── Multi-database output (--all-databases) ────────────────────────────────────
+def output_merged_json(
+    merged: List[Tuple[str, str, AdvisorReport]],
+    output_file: Optional[str],
+) -> None:
+    """Write the {instance, database, report} list produced by --all-databases.
+
+    This is the exact shape support teams have already been hand-assembling
+    by running the tool once per database and concatenating the JSON output
+    themselves — --all-databases now produces it directly.
+    """
+    data = [
+        {"instance": instance, "database": dbname, "report": report_to_dict(report)}
+        for instance, dbname, report in merged
+    ]
+    out = json.dumps(data, indent=2, default=str)
+    if output_file:
+        with open(output_file, "w") as fh:
+            fh.write(out)
+        console.print(f"[green]✓ Merged JSON report ({len(merged)} database(s)) written to {output_file}[/green]")
+    else:
+        print(out)
+
+
+def output_merged_csv(
+    merged: List[Tuple[str, str, AdvisorReport]],
+    output_file: Optional[str],
+) -> None:
+    """Flatten every database's table rows into one CSV, tagged by instance/database."""
+    rows: List[Dict] = []
+    for instance, dbname, report in merged:
+        for t in report.tables:
+            row = {"instance": instance, "database": dbname, **_table_to_dict(t)}
+            row["statuses"] = "|".join(row["statuses"])  # type: ignore[arg-type]
+            rows.append(row)
+
+    if not rows:
+        console.print("[yellow]No tables to export across any database.[/yellow]")
+        return
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    out = buf.getvalue()
+    if output_file:
+        with open(output_file, "w") as fh:
+            fh.write(out)
+        console.print(f"[green]✓ Merged CSV report ({len(merged)} database(s)) written to {output_file}[/green]")
+    else:
+        print(out)
+
+
 # ── Replay from JSON ──────────────────────────────────────────────────────────
-def load_report_from_json(path: str) -> AdvisorReport:
-    """Reconstruct an AdvisorReport from a JSON file produced by --format json."""
+def _parse_json_file(path: str):
+    """Shared file-read/parse error handling for --replay, single- or multi-db."""
     try:
         with open(path) as f:
-            data = json.load(f)
+            return json.load(f)
     except FileNotFoundError:
         console.print(f"[bold red]File not found:[/bold red] {path}")
         sys.exit(1)
@@ -1033,6 +1201,12 @@ def load_report_from_json(path: str) -> AdvisorReport:
         console.print(f"[bold red]Invalid JSON:[/bold red] {e}")
         sys.exit(1)
 
+
+def report_from_dict(data: Dict) -> AdvisorReport:
+    """Reconstruct an AdvisorReport from a single-database report dict —
+    i.e. one element of the shape --format json produces, or one entry's
+    "report" field inside a --all-databases merged list.
+    """
     tables: List[TableHealth] = []
     for t in data["tables"]:
         last_av = last_ana = None
@@ -1053,6 +1227,11 @@ def load_report_from_json(path: str) -> AdvisorReport:
             n_dead=t["n_dead"],
             dead_pct=t["dead_pct"],
             size_bytes=t["size_bytes"],
+            # Backward-compatible: older JSON reports predate this field.
+            estimated_dead_bytes=t.get(
+                "estimated_dead_bytes",
+                int(t["size_bytes"] * t["dead_pct"] / 100.0),
+            ),
             last_autovacuum=last_av,
             last_autoanalyze=last_ana,
             n_mod_since_analyze=t["n_mod_since_analyze"],
@@ -1106,6 +1285,57 @@ def load_report_from_json(path: str) -> AdvisorReport:
     )
 
 
+def load_report_from_json(path: str) -> AdvisorReport:
+    """Reconstruct an AdvisorReport from a single-database JSON file
+    produced by plain `--format json` (not `--all-databases`).
+    """
+    data = _parse_json_file(path)
+    if isinstance(data, list):
+        console.print(
+            "[bold red]This looks like a multi-database report[/bold red] "
+            "(a JSON list, produced by --all-databases) — pass it to --replay "
+            "directly; it's detected automatically and doesn't need this "
+            "single-database loader."
+        )
+        sys.exit(1)
+    return report_from_dict(data)
+
+
+def _merged_reports_from_data(data) -> List[Tuple[str, str, AdvisorReport]]:
+    """Convert already-parsed JSON data (a list) into (instance, database,
+    AdvisorReport) tuples. Shared by load_merged_reports_from_json() and the
+    --replay auto-detection path in main(), which has already parsed the file
+    once to check whether it's a list or a single object.
+    """
+    if not isinstance(data, list):
+        console.print(
+            "[bold red]Expected a multi-database JSON list[/bold red] "
+            "(instance/database/report entries) but got a single-database "
+            "report object instead."
+        )
+        sys.exit(1)
+
+    merged: List[Tuple[str, str, AdvisorReport]] = []
+    for entry in data:
+        try:
+            instance  = entry["instance"]
+            dbname    = entry["database"]
+            report    = report_from_dict(entry["report"])
+        except (KeyError, TypeError) as e:
+            console.print(f"[bold red]Malformed entry in merged JSON file:[/bold red] {e}")
+            sys.exit(1)
+        report.current_db = dbname
+        merged.append((instance, dbname, report))
+    return merged
+
+
+def load_merged_reports_from_json(path: str) -> List[Tuple[str, str, AdvisorReport]]:
+    """Reconstruct the {instance, database, report} list produced by
+    `--all-databases --format json`.
+    """
+    return _merged_reports_from_data(_parse_json_file(path))
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser(
@@ -1127,6 +1357,13 @@ examples:
 
   # Re-render console output from a JSON file (no database connection needed)
   python vacuum_advisor.py --replay report.json
+
+  # Analyze every database on the instance in one run (pg_stat_user_tables is
+  # database-scoped, so a normal run only ever sees one database)
+  python vacuum_advisor.py -H myhost -U postgres --all-databases --platform rds \\
+      --format json --output all_dbs_report.json
+  # rdsadmin/template0/template1 are skipped automatically; --exclude-db adds more
+  python vacuum_advisor.py -H myhost -U postgres --all-databases --exclude-db staging_db
 
   # AWS RDS (scale_factor default is 0.1, analyze_scale_factor default is 0.05)
   python vacuum_advisor.py -H mydb.abc123.us-east-1.rds.amazonaws.com -d mydb -U postgres --platform rds
@@ -1176,6 +1413,48 @@ examples:
         help="Show only the top N tables by dead rows in the health table",
     )
     ap.add_argument(
+        "--all-databases", action="store_true",
+        help=(
+            "Analyze every connectable database on the instance, not just one. "
+            "pg_stat_user_tables and pg_class are database-scoped, so a normal "
+            "run only ever sees the one database it connected to — this "
+            "enumerates every database via pg_database, runs the analysis "
+            "against each in turn, and merges the results into a list of "
+            "{instance, database, report} entries (report has the same shape "
+            "as a normal single-database report). Requires -H/--host, not "
+            "--conn, since a per-database connection string is built for each "
+            "database found. XID wraparound data is already cluster-wide and "
+            "will be identical across every entry. template0/template1 are "
+            "always skipped; the platform's own admin database (rdsadmin for "
+            "rds/aurora, cloudsqladmin for cloudsql) is skipped automatically "
+            "based on --platform — use --exclude-db to skip additional ones."
+        ),
+    )
+    ap.add_argument(
+        "--bootstrap-db", metavar="DB", default="postgres",
+        help=(
+            "Database used only to enumerate the other databases when "
+            "--all-databases is set (default: postgres). Not analyzed itself "
+            "unless it also shows up in the enumerated list and isn't excluded."
+        ),
+    )
+    ap.add_argument(
+        "--exclude-db", metavar="DB1,DB2,...", default="",
+        help=(
+            "Additional comma-separated database names to skip with "
+            "--all-databases, on top of the automatic exclusions "
+            "(template0/template1, and the platform's admin database)"
+        ),
+    )
+    ap.add_argument(
+        "--instance-label", metavar="NAME",
+        help=(
+            "Label recorded as \"instance\" in --all-databases output "
+            "(default: the -H/--host value). Useful for tagging results when "
+            "merging output from several instances afterward."
+        ),
+    )
+    ap.add_argument(
         "--platform",
         choices=["rds", "aurora", "cloudsql"],
         default="rds",
@@ -1200,15 +1479,88 @@ examples:
     global _platform_defaults
 
     # ── Replay mode: re-render console output from a JSON file ────────────────
+    # Auto-detects shape: a plain object is a single-database report; a list
+    # is the {instance, database, report} shape --all-databases produces.
     if args.replay:
-        report = load_report_from_json(args.replay)
-        _platform_defaults = PLATFORM_DEFAULTS.get(report.platform, _PG_ENGINE_DEFAULTS)
-        render_console(report, top=args.top)
+        raw = _parse_json_file(args.replay)
+        if isinstance(raw, list):
+            merged = _merged_reports_from_data(raw)
+            for instance, dbname, report in merged:
+                _platform_defaults = PLATFORM_DEFAULTS.get(report.platform, _PG_ENGINE_DEFAULTS)
+                console.print()
+                console.print(Panel(
+                    f"[bold cyan]Instance: {instance}   Database: {dbname}[/bold cyan]",
+                    expand=False,
+                ))
+                render_console(report, top=args.top)
+        else:
+            report = report_from_dict(raw)
+            _platform_defaults = PLATFORM_DEFAULTS.get(report.platform, _PG_ENGINE_DEFAULTS)
+            render_console(report, top=args.top)
         return
 
     # ── Require connection info when not in replay mode ───────────────────────
     if not args.conn and not args.host:
         ap.error("one of --conn / -H is required (or use --replay to render from a JSON file)")
+
+    if args.all_databases and args.conn:
+        ap.error(
+            "--all-databases requires -H/--host, not --conn — it needs to build a "
+            "separate connection string per database, which isn't possible from a "
+            "single pre-built DSN"
+        )
+
+    # ── Set platform defaults (used by effective() fallback) ───────────────────
+    _platform_defaults = PLATFORM_DEFAULTS.get(args.platform, _PG_ENGINE_DEFAULTS)
+
+    # ── --all-databases: loop over every connectable database on the instance ──
+    if args.all_databases:
+        # Password resolution order: PGPASSWORD env → interactive prompt (-W).
+        # Resolved once up front so we don't prompt once per database.
+        password = os.environ.get("PGPASSWORD", "")
+        if not password and args.password:
+            password = getpass.getpass("Password: ")
+
+        def conn_string_for(dbname: str) -> str:
+            parts = [f"host={args.host}", f"port={args.port}", f"dbname={dbname}"]
+            if args.username:
+                parts.append(f"user={args.username}")
+            if password:
+                parts.append(f"password={password}")
+            return " ".join(parts)
+
+        exclude = {d.strip() for d in args.exclude_db.split(",") if d.strip()}
+        exclude |= set(PLATFORM_INTERNAL_DATABASES.get(args.platform, []))
+        instance_label = args.instance_label or args.host
+
+        databases = list_target_databases(conn_string_for(args.bootstrap_db), exclude)
+        if not databases:
+            console.print("[yellow]No connectable databases found (after exclusions).[/yellow]")
+            return
+
+        merged: List[Tuple[str, str, AdvisorReport]] = []
+        for dbname in databases:
+            gsettings, raw_rows, xid_rows, pg_version, current_db = fetch_data(
+                conn_string_for(dbname), args.schema, args.min_rows
+            )
+            report = build_report(gsettings, raw_rows, xid_rows, pg_version, args.platform, current_db)
+            merged.append((instance_label, dbname, report))
+
+            if args.format == "console":
+                console.print()
+                console.print(Panel(
+                    f"[bold cyan]Database: {dbname}[/bold cyan]",
+                    title="[bold cyan]═══════════════════════════════════[/bold cyan]",
+                    expand=False,
+                ))
+                render_console(report, top=args.top)
+
+        if args.format == "json":
+            output_merged_json(merged, args.output)
+        elif args.format == "csv":
+            output_merged_csv(merged, args.output)
+        # console format already rendered per-database above
+        return
 
     # ── Build connection string ────────────────────────────────────────────────
     if args.conn:
@@ -1231,9 +1583,6 @@ examples:
         if password:
             parts.append(f"password={password}")
         conn_string = " ".join(parts)
-
-    # ── Set platform defaults (used by effective() fallback) ───────────────────
-    _platform_defaults = PLATFORM_DEFAULTS.get(args.platform, _PG_ENGINE_DEFAULTS)
 
     # ── Fetch → Analyse → Output ───────────────────────────────────────────────
     gsettings, raw_rows, xid_rows, pg_version, current_db = fetch_data(
