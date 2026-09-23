@@ -24,6 +24,8 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import psycopg2.extensions
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import vacuum_advisor as va
@@ -584,6 +586,58 @@ class TestAllDatabasesResilience:
                 assert False, "expected SystemExit"
             except SystemExit as e:
                 assert e.code == 1
+
+
+class TestConnectionStringSpecialChars:
+    """Connection strings are built with psycopg2.extensions.make_dsn(), not
+    naive f'password={password}' string concatenation. A password containing
+    a space breaks the naive form outright (parse_dsn raises), and one
+    containing a backslash is silently corrupted (backslashes are eaten by
+    libpq's own DSN parser) — both are realistic for generated passwords.
+    """
+
+    def test_single_database_mode_quotes_special_char_password(self):
+        captured = {}
+
+        def fake_fetch_data(conn_string, schema, min_rows, fetch_checkpoint=True):
+            captured["conn_string"] = conn_string
+            raise va.DatabaseFetchError("stop after capturing conn_string")
+
+        password = "pa ss\\w'ord"
+        argv = [
+            "vacuum_advisor.py", "-H", "myhost", "-d", "mydb", "-U", "myuser",
+            "--platform", "rds",
+        ]
+        with patch.object(sys, "argv", argv), \
+             patch.dict(os.environ, {"PGPASSWORD": password}), \
+             patch.object(va, "fetch_data", side_effect=fake_fetch_data):
+            try:
+                va.main()
+            except SystemExit:
+                pass
+
+        parsed = psycopg2.extensions.parse_dsn(captured["conn_string"])
+        assert parsed["password"] == password
+
+    def test_all_databases_mode_quotes_special_char_password(self):
+        captured = {}
+
+        def fake_list_target_databases(conn_string, exclude=None):
+            captured["bootstrap_conn_string"] = conn_string
+            return []
+
+        password = "pa ss\\w'ord"
+        argv = [
+            "vacuum_advisor.py", "-H", "myhost", "-U", "myuser",
+            "--all-databases", "--platform", "rds",
+        ]
+        with patch.object(sys, "argv", argv), \
+             patch.dict(os.environ, {"PGPASSWORD": password}), \
+             patch.object(va, "list_target_databases", side_effect=fake_list_target_databases):
+            va.main()  # empty database list after exclusions — returns cleanly
+
+        parsed = psycopg2.extensions.parse_dsn(captured["bootstrap_conn_string"])
+        assert parsed["password"] == password
 
 
 # ── --replay with multi-database (--all-databases) JSON ────────────────────

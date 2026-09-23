@@ -2178,12 +2178,12 @@ examples:
             password = getpass.getpass("Password: ")
 
         def conn_string_for(dbname: str) -> str:
-            parts = [f"host={args.host}", f"port={args.port}", f"dbname={dbname}"]
+            kwargs = {"host": args.host, "port": args.port, "dbname": dbname}
             if args.username:
-                parts.append(f"user={args.username}")
+                kwargs["user"] = args.username
             if password:
-                parts.append(f"password={password}")
-            return " ".join(parts)
+                kwargs["password"] = password
+            return psycopg2.extensions.make_dsn(**kwargs)
 
         exclude = {d.strip() for d in args.exclude_db.split(",") if d.strip()}
         exclude |= set(PLATFORM_INTERNAL_DATABASES.get(args.platform, []))
@@ -2271,21 +2271,17 @@ examples:
     else:
         if not args.dbname:
             ap.error("--dbname / -d is required when using -H / --host")
-        parts = [
-            f"host={args.host}",
-            f"port={args.port}",
-            f"dbname={args.dbname}",
-        ]
+        kwargs = {"host": args.host, "port": args.port, "dbname": args.dbname}
         if args.username:
-            parts.append(f"user={args.username}")
+            kwargs["user"] = args.username
         # Password resolution order: PGPASSWORD env → interactive prompt (-W)
         # Never accepted as a plain CLI arg to avoid leaking via process list.
         password = os.environ.get("PGPASSWORD", "")
         if not password and args.password:
             password = getpass.getpass("Password: ")
         if password:
-            parts.append(f"password={password}")
-        conn_string = " ".join(parts)
+            kwargs["password"] = password
+        conn_string = psycopg2.extensions.make_dsn(**kwargs)
 
     # ── Fetch → Analyse → Output ───────────────────────────────────────────────
     try:
