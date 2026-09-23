@@ -40,7 +40,9 @@ import csv
 import getpass
 import io
 import json
+import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -166,6 +168,30 @@ SCALE_TIERS: List[Tuple[int, float, str]] = [
 ]
 RECOMMENDED_THRESHOLD = 1_000  # vacuum/analyze threshold for large tables
 
+# ── Checkpoint & WAL Health Thresholds ──────────────────────────────────────────
+# checkpoints_req_pct at/above this bar means a majority of checkpoints are
+# being driven by WAL fill (checkpoints_req) rather than the checkpoint_timeout
+# timer (checkpoints_timed) — a strong signal that max_wal_size/checkpoint_timeout
+# are undersized for the current write rate.  Fixed constant, no CLI override,
+# consistent with how HIGH_DEAD_PCT and the other thresholds in this tool work.
+CHECKPOINT_REQ_PCT_THRESHOLD = 50.0
+
+# Tiered checkpoint_timeout recommendation, keyed by how far past
+# CHECKPOINT_REQ_PCT_THRESHOLD the observed checkpoints_req_pct is — mirrors the
+# SCALE_TIERS pattern used for vacuum scale_factor recommendations.  Evaluated
+# highest-bar-first; the first tier whose minimum the observed pct meets or
+# exceeds wins.
+CHECKPOINT_TIMEOUT_TIERS: List[Tuple[float, int, str]] = [
+    (90.0, 1800, "≥ 90% requested"),
+    (70.0, 1200, "≥ 70% requested"),
+    (50.0, 900,  "≥ 50% requested"),
+]
+
+# postgresqlco.nf / jberkus annotated.conf rule: below ~1 GB/hour of sustained
+# WAL generation, PostgreSQL's stock max_wal_size default is fine; above that,
+# size max_wal_size to cover at least one hour of WAL at the current rate.
+MAX_WAL_SIZE_HEADROOM_HOURS = 1
+
 # ── SQL ────────────────────────────────────────────────────────────────────────
 SQL_SETTINGS = """
     SELECT name, setting
@@ -241,6 +267,76 @@ SQL_LIST_DATABASES = """
     ORDER BY datname;
 """
 
+# ── Checkpoint & WAL Health SQL ──────────────────────────────────────────────
+# Version-gated: PostgreSQL 17 split checkpointer-specific counters out of
+# pg_stat_bgwriter into pg_stat_checkpointer. buffers_backend was removed from
+# pg_stat_bgwriter back in PG 16 (folded into pg_stat_io, which this tool does
+# not query — see CHECKPOINT_HEALTH_PLAN.md §4.2/§9 item 3).  These views are
+# instance-wide (not per-database), same as SQL_XID above.
+
+# PG >= 17 — pg_stat_checkpointer has the checkpoint-specific counters
+SQL_CHECKPOINTER_PG17 = """
+    SELECT
+        num_timed           AS checkpoints_timed,
+        num_requested        AS checkpoints_req,
+        buffers_written      AS buffers_checkpoint,
+        write_time           AS checkpoint_write_time_ms,
+        sync_time            AS checkpoint_sync_time_ms,
+        stats_reset
+    FROM pg_stat_checkpointer;
+"""
+
+# PG >= 17 — pg_stat_bgwriter still carries the background-writer counters
+SQL_BGWRITER_BUFFERS_CLEAN_ONLY = """
+    SELECT buffers_clean
+    FROM pg_stat_bgwriter;
+"""
+
+# PG < 16 — pg_stat_bgwriter has everything, including buffers_backend
+SQL_BGWRITER_PRE16 = """
+    SELECT
+        checkpoints_timed,
+        checkpoints_req,
+        buffers_checkpoint,
+        buffers_clean,
+        buffers_backend,
+        stats_reset
+    FROM pg_stat_bgwriter;
+"""
+
+# PG 16 — same view, but buffers_backend has already been removed
+SQL_BGWRITER_PG16 = """
+    SELECT
+        checkpoints_timed,
+        checkpoints_req,
+        buffers_checkpoint,
+        buffers_clean,
+        stats_reset
+    FROM pg_stat_bgwriter;
+"""
+
+SQL_BLOCK_SIZE = """
+    SELECT setting::int AS block_size
+    FROM   pg_settings
+    WHERE  name = 'block_size';
+"""
+
+# pg_stat_wal doesn't exist before PG 14
+SQL_WAL = """
+    SELECT wal_bytes, stats_reset AS wal_stats_reset
+    FROM pg_stat_wal;
+"""
+
+SQL_CHECKPOINT_SETTINGS = """
+    SELECT name, setting
+    FROM   pg_settings
+    WHERE  name IN (
+        'checkpoint_timeout',
+        'max_wal_size',
+        'checkpoint_completion_target'
+    );
+"""
+
 # ── Data Classes ───────────────────────────────────────────────────────────────
 @dataclass
 class TableHealth:
@@ -292,6 +388,55 @@ class Recommendation:
 
 
 @dataclass
+class CheckpointRecommendation:
+    needs_tuning:                     bool
+    reason:                           str    # short human-readable trigger explanation
+    recommended_checkpoint_timeout_s: int
+    recommended_max_wal_size_mb:      int
+    alter_system_sql:                 List[str] = field(default_factory=list)
+
+
+@dataclass
+class CheckpointHealth:
+    pg_stat_source:          str     # "pg_stat_bgwriter" | "pg_stat_checkpointer" — for debuggability
+
+    # Raw counters (post version-normalization)
+    checkpoints_timed:       int
+    checkpoints_req:         int
+    buffers_checkpoint:      int
+    buffers_clean:           int
+    buffers_backend:         Optional[int]   # None on PG >= 16 — removed from pg_stat_bgwriter
+    block_size:              int
+    stats_reset:             Optional[datetime]
+    checkpoint_write_time_ms: Optional[int]  # PG >= 17 only (pg_stat_checkpointer.write_time)
+    checkpoint_sync_time_ms:  Optional[int]  # PG >= 17 only
+
+    # WAL volume since stats_reset (None if pg_stat_wal unavailable, PG < 14)
+    wal_bytes:               Optional[int]
+    wal_stats_reset:         Optional[datetime]
+
+    # Derived (computed in the analyze step, not the fetch step)
+    checkpoints_total:       int
+    checkpoints_req_pct:     float
+    avg_checkpoint_write_bytes: int
+    total_written_bytes:     int
+    checkpoint_write_pct:    float
+    backend_write_pct:       Optional[float]   # None if buffers_backend unavailable
+    background_write_pct:    float
+    stats_window_seconds:    Optional[float]
+    wal_bytes_per_hour:      Optional[float]
+    avg_minutes_between_checkpoints: Optional[float]
+
+    # Current live settings (from pg_settings)
+    checkpoint_timeout_s:         int
+    max_wal_size_mb:              int
+    checkpoint_completion_target: float
+
+    statuses:       List[str] = field(default_factory=list)
+    recommendation: Optional[CheckpointRecommendation] = None
+
+
+@dataclass
 class AdvisorReport:
     pg_version:       str
     platform:         str           # "rds" | "aurora" | "cloudsql"
@@ -303,6 +448,9 @@ class AdvisorReport:
     xid_rows:         List[Dict]
     generated_at:     str
     current_db:       str = ""      # database the tool connected to
+    # Optional so replaying old JSON reports that predate this feature doesn't
+    # break — same backward-compat pattern used for estimated_dead_bytes.
+    checkpoint_health: Optional["CheckpointHealth"] = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -319,6 +467,24 @@ def fmt_bytes(n: int) -> str:
 def fmt_num(n) -> str:
     """Format a number with thousands separators."""
     return f"{int(n or 0):,}"
+
+
+def _pg_major_version(version_string: str) -> int:
+    """Parse the major version number out of a `SELECT version()` string.
+
+    e.g. "PostgreSQL 17.4 on x86_64-pc-linux-gnu, compiled by ..." -> 17
+         "PostgreSQL 9.6.24 on ..." -> 9  (pre-2018 two-part versioning)
+
+    Deliberately a regex, not a naive split — the string has commas and
+    parenthetical build info after the version number.  Pure function, no DB
+    connection needed, so it's unit-testable on its own.
+    """
+    match = re.search(r"PostgreSQL\s+(\d+)", version_string)
+    if not match:
+        raise ValueError(
+            f"Could not parse PostgreSQL major version from: {version_string!r}"
+        )
+    return int(match.group(1))
 
 
 def parse_reloptions(reloptions) -> Dict[str, str]:
@@ -402,18 +568,42 @@ def build_alter_sql(rec: Recommendation) -> str:
     return f"ALTER TABLE {fqtn} SET (\n" + ",\n".join(params) + "\n);"
 
 
+class DatabaseFetchError(Exception):
+    """Raised by fetch_data() on any connection/query failure.
+
+    fetch_data() itself never calls sys.exit() — that decision belongs to the
+    caller. A single-database run exits(1) immediately on this (same
+    behavior as before this was factored out). --all-databases instead
+    catches it per database, prints a warning, and continues with the rest —
+    one unreachable database (revoked CONNECT, auth mismatch, etc.) shouldn't
+    abort analysis of every other database on the instance.
+    """
+
+
 # ── Data Fetching ──────────────────────────────────────────────────────────────
 def fetch_data(
     conn_string: str,
     schema: Optional[str],
     min_rows: int,
-) -> Tuple[Dict[str, str], List[Dict], List[Dict], str, str]:
+    fetch_checkpoint: bool = True,
+) -> Tuple[Dict[str, str], List[Dict], List[Dict], str, str, Optional[Dict]]:
     """Open a read-only connection, run all queries, return raw data.
 
     Uses psycopg2.sql composition for all user-supplied values to prevent
     SQL injection.
 
-    Returns: (gsettings, table_rows, xid_rows, pg_version, current_db)
+    fetch_checkpoint: set False to skip the checkpoint/WAL health queries —
+    used by --all-databases, which fetches checkpoint health once per
+    instance (it's cluster-wide, not per-database) and reuses it across every
+    database's report rather than re-querying it for each one.
+
+    Returns: (gsettings, table_rows, xid_rows, pg_version, current_db, checkpoint_raw)
+    checkpoint_raw is None if fetch_checkpoint=False, or if the checkpoint/WAL
+    queries themselves fail (e.g. permissions, very old PG) — callers should
+    treat that as "checkpoint health unavailable", not a fatal error for the
+    rest of the report.
+    Raises: DatabaseFetchError on any connection or query failure (other than
+    the checkpoint/WAL queries, which degrade gracefully to None instead).
     """
     try:
         conn = psycopg2.connect(conn_string)
@@ -454,17 +644,87 @@ def fetch_data(
         cur.execute(SQL_XID)
         xid_rows: List[Dict] = cur.fetchall()  # type: ignore[assignment]
 
+        # Checkpoint/WAL health — instance-wide, cluster-level, not per-database.
+        # Degrades to None on failure (permissions, very old PG) rather than
+        # failing the whole fetch; the rest of the report is unaffected.
+        checkpoint_raw: Optional[Dict] = None
+        if fetch_checkpoint:
+            try:
+                checkpoint_raw = fetch_checkpoint_health(cur, pg_version)
+            except (psycopg2.Error, ValueError, KeyError):
+                checkpoint_raw = None
+
         cur.close()
         conn.close()
 
     except psycopg2.OperationalError as e:
-        console.print(f"\n[bold red]Could not connect:[/bold red] {e}")
-        sys.exit(1)
+        raise DatabaseFetchError(f"Could not connect: {e}") from e
     except psycopg2.Error as e:
-        console.print(f"\n[bold red]Database error:[/bold red] {e}")
-        sys.exit(1)
+        raise DatabaseFetchError(f"Database error: {e}") from e
 
-    return gsettings, rows, xid_rows, pg_version, current_db
+    return gsettings, rows, xid_rows, pg_version, current_db, checkpoint_raw
+
+
+def fetch_checkpoint_health(cur, pg_version: str) -> Dict:
+    """Fetch raw checkpoint/WAL counters using the already-open cursor.
+
+    Instance-wide, not per-database (same pattern as SQL_XID) — callers that
+    loop over multiple databases on one instance (--all-databases) should
+    call this once and reuse the result rather than once per database.
+
+    Returns a plain dict of raw values; build_checkpoint_health() does the
+    (pure, unit-testable) derived math separately.
+    """
+    major = _pg_major_version(pg_version)
+    raw: Dict = {"pg_major": major}
+
+    if major >= 17:
+        cur.execute(SQL_CHECKPOINTER_PG17)
+        cp = cur.fetchone()
+        cur.execute(SQL_BGWRITER_BUFFERS_CLEAN_ONLY)
+        bg = cur.fetchone()
+        raw["pg_stat_source"] = "pg_stat_checkpointer"
+        raw["checkpoints_timed"]        = cp["checkpoints_timed"]
+        raw["checkpoints_req"]          = cp["checkpoints_req"]
+        raw["buffers_checkpoint"]       = cp["buffers_checkpoint"]
+        raw["checkpoint_write_time_ms"] = cp["checkpoint_write_time_ms"]
+        raw["checkpoint_sync_time_ms"]  = cp["checkpoint_sync_time_ms"]
+        raw["stats_reset"]              = cp["stats_reset"]
+        raw["buffers_clean"]            = bg["buffers_clean"]
+        raw["buffers_backend"]          = None  # folded into pg_stat_io since PG 16 — not queried (v1)
+    else:
+        query = SQL_BGWRITER_PRE16 if major < 16 else SQL_BGWRITER_PG16
+        cur.execute(query)
+        bg = cur.fetchone()
+        raw["pg_stat_source"]           = "pg_stat_bgwriter"
+        raw["checkpoints_timed"]        = bg["checkpoints_timed"]
+        raw["checkpoints_req"]          = bg["checkpoints_req"]
+        raw["buffers_checkpoint"]       = bg["buffers_checkpoint"]
+        raw["buffers_clean"]            = bg["buffers_clean"]
+        raw["buffers_backend"]          = bg["buffers_backend"] if major < 16 else None
+        raw["stats_reset"]              = bg["stats_reset"]
+        raw["checkpoint_write_time_ms"] = None
+        raw["checkpoint_sync_time_ms"]  = None
+
+    cur.execute(SQL_BLOCK_SIZE)
+    raw["block_size"] = cur.fetchone()["block_size"]
+
+    if major >= 14:
+        cur.execute(SQL_WAL)
+        wal = cur.fetchone()
+        raw["wal_bytes"]       = wal["wal_bytes"]
+        raw["wal_stats_reset"] = wal["wal_stats_reset"]
+    else:
+        raw["wal_bytes"]       = None
+        raw["wal_stats_reset"] = None
+
+    cur.execute(SQL_CHECKPOINT_SETTINGS)
+    cp_settings = {r["name"]: r["setting"] for r in cur.fetchall()}
+    raw["checkpoint_timeout_s"]         = int(cp_settings.get("checkpoint_timeout", 300))
+    raw["max_wal_size_mb"]              = int(cp_settings.get("max_wal_size", 1024))
+    raw["checkpoint_completion_target"] = float(cp_settings.get("checkpoint_completion_target", 0.9))
+
+    return raw
 
 
 def list_target_databases(bootstrap_conn_string: str, exclude: Optional[set] = None) -> List[str]:
@@ -567,6 +827,193 @@ def analyze_table_row(row: Dict, gsettings: Dict[str, str]) -> TableHealth:
     )
 
 
+def recommended_checkpoint_timeout_s(checkpoints_req_pct: float) -> Tuple[int, str]:
+    """Tiered checkpoint_timeout recommendation, keyed by how far past
+    CHECKPOINT_REQ_PCT_THRESHOLD the observed checkpoints_req_pct is.
+    Returns (recommended_seconds, tier_label).
+    """
+    for min_pct, timeout_s, label in CHECKPOINT_TIMEOUT_TIERS:
+        if checkpoints_req_pct >= min_pct:
+            return timeout_s, label
+    # Below every tier — shouldn't be reached when needs_tuning is True, since
+    # the lowest tier matches CHECKPOINT_REQ_PCT_THRESHOLD, but fall back safely.
+    return CHECKPOINT_TIMEOUT_TIERS[-1][1], CHECKPOINT_TIMEOUT_TIERS[-1][2]
+
+
+def recommend_checkpoint_tuning(ch: "CheckpointHealth") -> CheckpointRecommendation:
+    """Direct implementation of the formula worked out in
+    CHECKPOINT_HEALTH_PLAN.md §5:
+
+    A requested checkpoint fires when WAL written since the last checkpoint
+    approaches max_wal_size — roughly max_wal_size / (1 + checkpoint_completion_target).
+    At the current WAL rate, compute how long that takes to fill; if it's less
+    than checkpoint_timeout, checkpoints are WAL-triggered, not time-triggered.
+    """
+    needs_tuning = ch.checkpoints_total > 0 and ch.checkpoints_req_pct >= CHECKPOINT_REQ_PCT_THRESHOLD
+
+    if not needs_tuning:
+        return CheckpointRecommendation(
+            needs_tuning=False,
+            reason="",
+            recommended_checkpoint_timeout_s=ch.checkpoint_timeout_s,
+            recommended_max_wal_size_mb=ch.max_wal_size_mb,
+            alter_system_sql=[],
+        )
+
+    effective_trigger_bytes = (
+        ch.max_wal_size_mb * 1024 * 1024 / (1 + ch.checkpoint_completion_target)
+    )
+
+    minutes_to_fill: Optional[float] = None
+    if ch.wal_bytes_per_hour:
+        bytes_per_minute = ch.wal_bytes_per_hour / 60.0
+        if bytes_per_minute > 0:
+            minutes_to_fill = effective_trigger_bytes / bytes_per_minute
+
+    recommended_timeout_s, _tier_label = recommended_checkpoint_timeout_s(ch.checkpoints_req_pct)
+
+    # Size max_wal_size per the postgresqlco.nf / jberkus annotated.conf rule:
+    # at least MAX_WAL_SIZE_HEADROOM_HOURS of WAL at the current generation
+    # rate, floored at whatever max_wal_size is already set to (never
+    # recommend shrinking it).  No pg_stat_wal (PG < 14) → nothing to size
+    # against, leave as-is.
+    one_hour_of_wal_mb = (
+        (ch.wal_bytes_per_hour * MAX_WAL_SIZE_HEADROOM_HOURS) / (1024 * 1024)
+        if ch.wal_bytes_per_hour else None
+    )
+    recommended_max_wal_size_mb = (
+        max(ch.max_wal_size_mb, math.ceil(one_hour_of_wal_mb))
+        if one_hour_of_wal_mb is not None
+        else ch.max_wal_size_mb
+    )
+
+    if minutes_to_fill is not None:
+        reason = (
+            f"{ch.checkpoints_req_pct:.0f}% of checkpoints are WAL-triggered "
+            f"(checkpoints_req), not timer-triggered — at the current WAL rate "
+            f"the {fmt_bytes(effective_trigger_bytes)} trigger point fills in "
+            f"~{minutes_to_fill:.1f} min, well under checkpoint_timeout "
+            f"({ch.checkpoint_timeout_s}s)."
+        )
+    else:
+        reason = (
+            f"{ch.checkpoints_req_pct:.0f}% of checkpoints are WAL-triggered "
+            f"(checkpoints_req) rather than timer-triggered."
+        )
+
+    # Always recommended together — raising max_wal_size without raising
+    # checkpoint_timeout just delays the same problem.
+    alter_system_sql = [
+        f"ALTER SYSTEM SET checkpoint_timeout = '{recommended_timeout_s}s';",
+        f"ALTER SYSTEM SET max_wal_size = '{recommended_max_wal_size_mb}MB';",
+    ]
+
+    return CheckpointRecommendation(
+        needs_tuning=True,
+        reason=reason,
+        recommended_checkpoint_timeout_s=recommended_timeout_s,
+        recommended_max_wal_size_mb=recommended_max_wal_size_mb,
+        alter_system_sql=alter_system_sql,
+    )
+
+
+def build_checkpoint_health(raw: Dict, now: Optional[datetime] = None) -> CheckpointHealth:
+    """Pure function: compute derived percentages/rates from the raw dict
+    fetch_checkpoint_health() returns, then attach a recommendation.
+    Unit-testable with synthetic input dicts, same pattern as
+    analyze_table_row().
+    """
+    now = now or datetime.now(timezone.utc)
+
+    checkpoints_timed = int(raw.get("checkpoints_timed") or 0)
+    checkpoints_req    = int(raw.get("checkpoints_req")   or 0)
+    checkpoints_total  = checkpoints_timed + checkpoints_req
+    checkpoints_req_pct = (
+        round(100.0 * checkpoints_req / checkpoints_total, 1)
+        if checkpoints_total > 0 else 0.0
+    )
+
+    buffers_checkpoint = int(raw.get("buffers_checkpoint") or 0)
+    buffers_clean       = int(raw.get("buffers_clean")      or 0)
+    _bb = raw.get("buffers_backend")
+    buffers_backend: Optional[int] = int(_bb) if _bb is not None else None
+    block_size = int(raw.get("block_size") or 8192)
+
+    avg_checkpoint_write_bytes = (
+        int(buffers_checkpoint * block_size / checkpoints_total)
+        if checkpoints_total > 0 else 0
+    )
+    total_written_bytes = block_size * (
+        buffers_checkpoint + buffers_clean + (buffers_backend or 0)
+    )
+    checkpoint_write_pct = (
+        round(100.0 * buffers_checkpoint * block_size / total_written_bytes, 1)
+        if total_written_bytes > 0 else 0.0
+    )
+    backend_write_pct: Optional[float] = (
+        round(100.0 * buffers_backend * block_size / total_written_bytes, 1)
+        if (buffers_backend is not None and total_written_bytes > 0) else None
+    )
+    background_write_pct = (
+        round(100.0 * buffers_clean * block_size / total_written_bytes, 1)
+        if total_written_bytes > 0 else 0.0
+    )
+
+    stats_reset = raw.get("stats_reset")
+    stats_window_seconds: Optional[float] = None
+    if stats_reset:
+        delta = (now - stats_reset).total_seconds()
+        stats_window_seconds = delta if delta > 0 else None
+
+    avg_minutes_between_checkpoints: Optional[float] = None
+    if stats_window_seconds and checkpoints_total > 0:
+        avg_minutes_between_checkpoints = round(
+            stats_window_seconds / 60.0 / checkpoints_total, 2
+        )
+
+    wal_bytes = raw.get("wal_bytes")
+    wal_bytes_per_hour: Optional[float] = None
+    if wal_bytes is not None and stats_window_seconds:
+        wal_bytes_per_hour = float(wal_bytes) / (stats_window_seconds / 3600.0)
+
+    statuses: List[str] = []
+    if checkpoints_total > 0 and checkpoints_req_pct >= CHECKPOINT_REQ_PCT_THRESHOLD:
+        statuses.append("CHECKPOINT_PRESSURE")
+    if not statuses:
+        statuses.append("OK")
+
+    ch = CheckpointHealth(
+        pg_stat_source=raw.get("pg_stat_source", "pg_stat_bgwriter"),
+        checkpoints_timed=checkpoints_timed,
+        checkpoints_req=checkpoints_req,
+        buffers_checkpoint=buffers_checkpoint,
+        buffers_clean=buffers_clean,
+        buffers_backend=buffers_backend,
+        block_size=block_size,
+        stats_reset=stats_reset,
+        checkpoint_write_time_ms=raw.get("checkpoint_write_time_ms"),
+        checkpoint_sync_time_ms=raw.get("checkpoint_sync_time_ms"),
+        wal_bytes=int(wal_bytes) if wal_bytes is not None else None,
+        wal_stats_reset=raw.get("wal_stats_reset"),
+        checkpoints_total=checkpoints_total,
+        checkpoints_req_pct=checkpoints_req_pct,
+        avg_checkpoint_write_bytes=avg_checkpoint_write_bytes,
+        total_written_bytes=total_written_bytes,
+        checkpoint_write_pct=checkpoint_write_pct,
+        backend_write_pct=backend_write_pct,
+        background_write_pct=background_write_pct,
+        stats_window_seconds=stats_window_seconds,
+        wal_bytes_per_hour=wal_bytes_per_hour,
+        avg_minutes_between_checkpoints=avg_minutes_between_checkpoints,
+        checkpoint_timeout_s=int(raw.get("checkpoint_timeout_s", 300)),
+        max_wal_size_mb=int(raw.get("max_wal_size_mb", 1024)),
+        checkpoint_completion_target=float(raw.get("checkpoint_completion_target", 0.9)),
+        statuses=statuses,
+    )
+    ch.recommendation = recommend_checkpoint_tuning(ch)
+    return ch
+
+
 def build_recommendations(
     tables: List[TableHealth],
 ) -> List[Recommendation]:
@@ -626,7 +1073,12 @@ def build_report(
     pg_version: str,
     platform: str,
     current_db: str = "",
+    checkpoint_health: Optional[CheckpointHealth] = None,
 ) -> AdvisorReport:
+    """checkpoint_health is already-built (via build_checkpoint_health()), not
+    raw — this lets --all-databases build it once per instance and pass the
+    same object into every database's report instead of recomputing it.
+    """
     tables = [analyze_table_row(r, gsettings) for r in raw_rows]
     recs   = build_recommendations(tables)
     return AdvisorReport(
@@ -640,6 +1092,7 @@ def build_report(
         xid_rows=[dict(x) for x in xid_rows],
         generated_at=datetime.now(timezone.utc).isoformat(),
         current_db=current_db,
+        checkpoint_health=checkpoint_health,
     )
 
 
@@ -795,6 +1248,95 @@ def _status_rich(statuses: List[str]) -> str:
     if "NEAR_ANALYZE_TRIGGER" in statuses: parts.append("[bold yellow]📈 NEAR ANA[/bold yellow]")
     if statuses == ["OK"]:                 parts.append("[green]✓ OK[/green]")
     return " ".join(parts)
+
+
+def show_checkpoint_health(report: AdvisorReport) -> None:
+    """Checkpoint & WAL Health panel — placement in render_console() is after
+    show_xid_warnings(), before show_disabled_tables(), since checkpoint/WAL
+    pressure is architecturally closer to "instance health" than to "table
+    health."
+    """
+    ch = report.checkpoint_health
+    if ch is None:
+        return
+
+    reset_str = ch.stats_reset.strftime("%Y-%m-%d") if ch.stats_reset else "unknown"
+    checkpoints_line = (
+        f"  Checkpoints (since {reset_str})  : {fmt_num(ch.checkpoints_total)} "
+        f"({fmt_num(ch.checkpoints_timed)} timed / {fmt_num(ch.checkpoints_req)} req)"
+    )
+    interval_line = (
+        f"  Avg time between checkpoints    : {ch.avg_minutes_between_checkpoints:.1f} min"
+        if ch.avg_minutes_between_checkpoints is not None
+        else "  Avg time between checkpoints    : n/a"
+    )
+    if ch.wal_bytes is not None:
+        wal_rate = f" (~{fmt_bytes(ch.wal_bytes_per_hour)}/hour avg)" if ch.wal_bytes_per_hour else ""
+        wal_line = f"  WAL generated                   : {fmt_bytes(ch.wal_bytes)}{wal_rate}"
+    else:
+        wal_line = "  WAL generated                   : n/a (pg_stat_wal unavailable — PG < 14)"
+
+    backend_line = (
+        f"  Backend writes (unbuffered)     : {ch.backend_write_pct:.1f}% of all buffer writes"
+        if ch.backend_write_pct is not None
+        else "  Backend writes (unbuffered)     : unavailable on PG ≥ 16 "
+             "(removed from pg_stat_bgwriter, folded into pg_stat_io — not queried in v1)"
+    )
+
+    pressure = "CHECKPOINT_PRESSURE" in ch.statuses
+    header = (
+        f"[bold red]⚠ {ch.checkpoints_req_pct:.1f}% of checkpoints are requested "
+        "(WAL-triggered), not timed[/bold red]"
+        if pressure else
+        f"[bold green]✓ {ch.checkpoints_req_pct:.1f}% of checkpoints are requested "
+        "— within normal range[/bold green]"
+    )
+
+    body_lines = [
+        header,
+        "",
+        checkpoints_line,
+        interval_line,
+        wal_line,
+        backend_line,
+        f"  checkpoint_timeout (current)    : {ch.checkpoint_timeout_s}s",
+        f"  max_wal_size (current)          : {ch.max_wal_size_mb} MB",
+        f"  checkpoint_completion_target    : {ch.checkpoint_completion_target}",
+    ]
+
+    rec = ch.recommendation
+    if rec and rec.needs_tuning:
+        body_lines += [
+            "",
+            f"  [dim]{rec.reason}[/dim]",
+            "",
+            "  [bold yellow]Recommended (raise together):[/bold yellow]",
+            f"    checkpoint_timeout = {rec.recommended_checkpoint_timeout_s}s",
+            f"    max_wal_size       = {rec.recommended_max_wal_size_mb} MB   "
+            "[dim](≥ 1 hour of WAL at current rate — sized from the pg_stat_wal\n"
+            "                                    average over the stats window)[/dim]",
+            "",
+        ]
+        for line in rec.alter_system_sql:
+            body_lines.append(f"  [bold green]{line}[/bold green]")
+        body_lines += [
+            "",
+            "  [dim]Caveat: more WAL between checkpoints means longer crash/failover\n"
+            "  recovery — a conscious durability trade, reversible, no reboot\n"
+            "  needed (both are dynamic GUCs).[/dim]",
+        ]
+    elif pressure:
+        body_lines += [
+            "",
+            "  [dim]Below the tuning threshold, but keep an eye on this if write volume grows.[/dim]",
+        ]
+
+    console.print()
+    console.print(Panel(
+        "\n".join(body_lines),
+        title="[bold cyan]Checkpoint & WAL Health[/bold cyan]",
+        expand=False,
+    ))
 
 
 def show_disabled_tables(report: AdvisorReport) -> None:
@@ -1014,10 +1556,12 @@ def show_summary(report: AdvisorReport) -> None:
     ))
 
 
-def render_console(report: AdvisorReport, top: Optional[int] = None) -> None:
+def render_console(report: AdvisorReport, top: Optional[int] = None, show_checkpoint: bool = True) -> None:
     show_header(report)
     show_settings(report)
     show_xid_warnings(report)
+    if show_checkpoint:
+        show_checkpoint_health(report)
     show_disabled_tables(report)
     show_table_health(report, top=top)
     show_recommendations(report)
@@ -1071,6 +1615,109 @@ def _rec_to_dict(r: Recommendation) -> Dict:
     }
 
 
+def _checkpoint_health_to_dict(ch: Optional[CheckpointHealth]) -> Optional[Dict]:
+    """checkpoint_health is null when the underlying stats couldn't be read at
+    all (permissions issue, extremely old PG) rather than omitted — keeps the
+    schema predictable for consumers (json_to_report.py etc.) instead of
+    requiring a .get() check everywhere.
+    """
+    if ch is None:
+        return None
+    rec = ch.recommendation
+    return {
+        "pg_stat_source":             ch.pg_stat_source,
+        "checkpoints_timed":          ch.checkpoints_timed,
+        "checkpoints_req":            ch.checkpoints_req,
+        "checkpoints_total":          ch.checkpoints_total,
+        "checkpoints_req_pct":        ch.checkpoints_req_pct,
+        "buffers_checkpoint":         ch.buffers_checkpoint,
+        "buffers_clean":              ch.buffers_clean,
+        "buffers_backend":            ch.buffers_backend,
+        "block_size":                 ch.block_size,
+        "avg_checkpoint_write_bytes": ch.avg_checkpoint_write_bytes,
+        "total_written_bytes":        ch.total_written_bytes,
+        "checkpoint_write_pct":       ch.checkpoint_write_pct,
+        "backend_write_pct":          ch.backend_write_pct,
+        "background_write_pct":       ch.background_write_pct,
+        "stats_reset":                ch.stats_reset.isoformat() if ch.stats_reset else None,
+        "stats_window_seconds":       ch.stats_window_seconds,
+        "wal_bytes":                  ch.wal_bytes,
+        "wal_stats_reset":            ch.wal_stats_reset.isoformat() if ch.wal_stats_reset else None,
+        "wal_bytes_per_hour":         ch.wal_bytes_per_hour,
+        "avg_minutes_between_checkpoints": ch.avg_minutes_between_checkpoints,
+        "checkpoint_timeout_s":       ch.checkpoint_timeout_s,
+        "max_wal_size_mb":            ch.max_wal_size_mb,
+        "checkpoint_completion_target": ch.checkpoint_completion_target,
+        "checkpoint_write_time_ms":   ch.checkpoint_write_time_ms,
+        "checkpoint_sync_time_ms":    ch.checkpoint_sync_time_ms,
+        "statuses":                   ch.statuses,
+        "recommendation": {
+            "needs_tuning":                      rec.needs_tuning,
+            "reason":                             rec.reason,
+            "recommended_checkpoint_timeout_s":   rec.recommended_checkpoint_timeout_s,
+            "recommended_max_wal_size_mb":        rec.recommended_max_wal_size_mb,
+            "alter_system_sql":                   rec.alter_system_sql,
+        } if rec else None,
+    }
+
+
+def _checkpoint_health_from_dict(data: Optional[Dict]) -> Optional[CheckpointHealth]:
+    """Reconstruct CheckpointHealth from a report dict's "checkpoint_health"
+    key. Returns None if the key is missing/null — older JSON reports that
+    predate this feature (or a live run where the stats were unavailable)
+    still replay fine; the console section is simply skipped.
+    """
+    if not data:
+        return None
+
+    def _parse_dt(val):
+        if not val:
+            return None
+        try:
+            return datetime.fromisoformat(val)
+        except (ValueError, TypeError):
+            return None
+
+    rec_data = data.get("recommendation")
+    rec = CheckpointRecommendation(
+        needs_tuning=rec_data["needs_tuning"],
+        reason=rec_data["reason"],
+        recommended_checkpoint_timeout_s=rec_data["recommended_checkpoint_timeout_s"],
+        recommended_max_wal_size_mb=rec_data["recommended_max_wal_size_mb"],
+        alter_system_sql=rec_data.get("alter_system_sql", []),
+    ) if rec_data else None
+
+    return CheckpointHealth(
+        pg_stat_source=data.get("pg_stat_source", "pg_stat_bgwriter"),
+        checkpoints_timed=data["checkpoints_timed"],
+        checkpoints_req=data["checkpoints_req"],
+        buffers_checkpoint=data["buffers_checkpoint"],
+        buffers_clean=data["buffers_clean"],
+        buffers_backend=data.get("buffers_backend"),
+        block_size=data["block_size"],
+        stats_reset=_parse_dt(data.get("stats_reset")),
+        checkpoint_write_time_ms=data.get("checkpoint_write_time_ms"),
+        checkpoint_sync_time_ms=data.get("checkpoint_sync_time_ms"),
+        wal_bytes=data.get("wal_bytes"),
+        wal_stats_reset=_parse_dt(data.get("wal_stats_reset")),
+        checkpoints_total=data["checkpoints_total"],
+        checkpoints_req_pct=data["checkpoints_req_pct"],
+        avg_checkpoint_write_bytes=data["avg_checkpoint_write_bytes"],
+        total_written_bytes=data["total_written_bytes"],
+        checkpoint_write_pct=data["checkpoint_write_pct"],
+        backend_write_pct=data.get("backend_write_pct"),
+        background_write_pct=data["background_write_pct"],
+        stats_window_seconds=data.get("stats_window_seconds"),
+        wal_bytes_per_hour=data.get("wal_bytes_per_hour"),
+        avg_minutes_between_checkpoints=data.get("avg_minutes_between_checkpoints"),
+        checkpoint_timeout_s=data["checkpoint_timeout_s"],
+        max_wal_size_mb=data["max_wal_size_mb"],
+        checkpoint_completion_target=data["checkpoint_completion_target"],
+        statuses=data.get("statuses", []),
+        recommendation=rec,
+    )
+
+
 def report_to_dict(report: AdvisorReport) -> Dict:
     """Convert an AdvisorReport to the plain-dict shape used by --format json.
 
@@ -1092,6 +1739,7 @@ def report_to_dict(report: AdvisorReport) -> Dict:
         ],
         "tables":          [_table_to_dict(t) for t in report.tables],
         "recommendations": [_rec_to_dict(r)   for r in report.recommendations],
+        "checkpoint_health": _checkpoint_health_to_dict(report.checkpoint_health),
         "summary": {
             "total_tables":       len(report.tables),
             "autovacuum_disabled":sum(1 for t in report.tables if not t.autovacuum_enabled),
@@ -1282,6 +1930,8 @@ def report_from_dict(data: Dict) -> AdvisorReport:
         xid_rows=data["xid_data"],
         generated_at=data["generated_at"],
         current_db="",  # not stored in JSON; "(current database)" tag will be omitted
+        # .get() default: older JSON reports that predate this feature still replay.
+        checkpoint_health=_checkpoint_health_from_dict(data.get("checkpoint_health")),
     )
 
 
@@ -1485,6 +2135,10 @@ examples:
         raw = _parse_json_file(args.replay)
         if isinstance(raw, list):
             merged = _merged_reports_from_data(raw)
+            # Checkpoint health is identical across every entry in a merged
+            # --all-databases report (it's instance-wide) — render it once,
+            # before the per-database loop, rather than once per database.
+            shown_checkpoint = False
             for instance, dbname, report in merged:
                 _platform_defaults = PLATFORM_DEFAULTS.get(report.platform, _PG_ENGINE_DEFAULTS)
                 console.print()
@@ -1492,7 +2146,9 @@ examples:
                     f"[bold cyan]Instance: {instance}   Database: {dbname}[/bold cyan]",
                     expand=False,
                 ))
-                render_console(report, top=args.top)
+                render_console(report, top=args.top, show_checkpoint=not shown_checkpoint)
+                if report.checkpoint_health is not None:
+                    shown_checkpoint = True
         else:
             report = report_from_dict(raw)
             _platform_defaults = PLATFORM_DEFAULTS.get(report.platform, _PG_ENGINE_DEFAULTS)
@@ -1539,11 +2195,38 @@ examples:
             return
 
         merged: List[Tuple[str, str, AdvisorReport]] = []
+        skipped: List[Tuple[str, str]] = []  # (dbname, error message)
+        # Checkpoint/WAL health is instance-wide, not per-database (same as
+        # xid_data) — fetched once against the first database that succeeds,
+        # then the same built CheckpointHealth object is reused for every
+        # other database's report rather than re-querying it each time.
+        cached_checkpoint_health: Optional[CheckpointHealth] = None
+        checkpoint_fetch_attempted = False
+        first_console_checkpoint_shown = False
         for dbname in databases:
-            gsettings, raw_rows, xid_rows, pg_version, current_db = fetch_data(
-                conn_string_for(dbname), args.schema, args.min_rows
+            want_checkpoint = not checkpoint_fetch_attempted
+            try:
+                gsettings, raw_rows, xid_rows, pg_version, current_db, checkpoint_raw = fetch_data(
+                    conn_string_for(dbname), args.schema, args.min_rows,
+                    fetch_checkpoint=want_checkpoint,
+                )
+            except DatabaseFetchError as e:
+                # One unreachable database (revoked CONNECT, auth mismatch,
+                # etc.) shouldn't abort analysis of every other database on
+                # the instance — warn, skip it, and keep going.
+                console.print(f"[yellow]⚠ Skipping database '{dbname}': {e}[/yellow]")
+                skipped.append((dbname, str(e)))
+                continue
+
+            if want_checkpoint:
+                checkpoint_fetch_attempted = True
+                if checkpoint_raw:
+                    cached_checkpoint_health = build_checkpoint_health(checkpoint_raw)
+
+            report = build_report(
+                gsettings, raw_rows, xid_rows, pg_version, args.platform, current_db,
+                checkpoint_health=cached_checkpoint_health,
             )
-            report = build_report(gsettings, raw_rows, xid_rows, pg_version, args.platform, current_db)
             merged.append((instance_label, dbname, report))
 
             if args.format == "console":
@@ -1553,13 +2236,33 @@ examples:
                     title="[bold cyan]═══════════════════════════════════[/bold cyan]",
                     expand=False,
                 ))
-                render_console(report, top=args.top)
+                # Checkpoint health is identical across every database in this
+                # merge — show the panel once, not once per database.
+                render_console(
+                    report, top=args.top,
+                    show_checkpoint=not first_console_checkpoint_shown,
+                )
+                if cached_checkpoint_health is not None:
+                    first_console_checkpoint_shown = True
 
         if args.format == "json":
             output_merged_json(merged, args.output)
         elif args.format == "csv":
             output_merged_csv(merged, args.output)
         # console format already rendered per-database above
+
+        if skipped:
+            console.print()
+            console.print(Panel(
+                f"[bold yellow]⚠ Skipped {len(skipped)} of {len(databases)} database(s) "
+                "due to connection/query errors[/bold yellow]\n\n"
+                + "\n".join(f"  • {dbname}: {msg}" for dbname, msg in skipped),
+                title="[bold yellow]Skipped Databases[/bold yellow]",
+                expand=False,
+            ))
+        if not merged:
+            console.print("[bold red]No database could be analyzed — every connection attempt failed.[/bold red]")
+            sys.exit(1)
         return
 
     # ── Build connection string ────────────────────────────────────────────────
@@ -1585,10 +2288,18 @@ examples:
         conn_string = " ".join(parts)
 
     # ── Fetch → Analyse → Output ───────────────────────────────────────────────
-    gsettings, raw_rows, xid_rows, pg_version, current_db = fetch_data(
-        conn_string, args.schema, args.min_rows
+    try:
+        gsettings, raw_rows, xid_rows, pg_version, current_db, checkpoint_raw = fetch_data(
+            conn_string, args.schema, args.min_rows
+        )
+    except DatabaseFetchError as e:
+        console.print(f"\n[bold red]{e}[/bold red]")
+        sys.exit(1)
+    checkpoint_health = build_checkpoint_health(checkpoint_raw) if checkpoint_raw else None
+    report = build_report(
+        gsettings, raw_rows, xid_rows, pg_version, args.platform, current_db,
+        checkpoint_health=checkpoint_health,
     )
-    report = build_report(gsettings, raw_rows, xid_rows, pg_version, args.platform, current_db)
 
     if args.format == "json":
         output_json(report, args.output)

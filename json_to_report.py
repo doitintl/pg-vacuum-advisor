@@ -89,7 +89,65 @@ def generate_report(data):
     report.append("")
     report.append("---")
     report.append("")
-    
+
+    # Checkpoint & WAL Health (additive, optional — older reports predate this)
+    ch = data.get('checkpoint_health')
+    if ch:
+        report.append("## Checkpoint & WAL Health")
+        report.append("")
+        report.append("> `checkpoints_req` (requested/WAL-triggered) vs `checkpoints_timed` "
+                       "(timer-triggered). A high requested percentage means WAL is filling "
+                       "`max_wal_size` faster than `checkpoint_timeout` would otherwise trigger "
+                       "a checkpoint — evidence that both settings are undersized for the "
+                       "current write rate.")
+        report.append("")
+        report.append(f"- **Source view:** `{ch.get('pg_stat_source', 'N/A')}`")
+        report.append(f"- **Checkpoints:** {format_number(ch.get('checkpoints_total'))} total "
+                       f"({format_number(ch.get('checkpoints_timed'))} timed / "
+                       f"{format_number(ch.get('checkpoints_req'))} requested)")
+        report.append(f"- **Requested %:** {ch.get('checkpoints_req_pct')}%")
+        avg_min = ch.get('avg_minutes_between_checkpoints')
+        report.append(f"- **Avg time between checkpoints:** "
+                       f"{f'{avg_min:.1f} min' if avg_min is not None else 'N/A'}")
+        wal_bytes = ch.get('wal_bytes')
+        wal_rate = ch.get('wal_bytes_per_hour')
+        if wal_bytes is not None:
+            rate_str = f" (~{format_bytes(wal_rate)}/hour avg)" if wal_rate else ""
+            report.append(f"- **WAL generated (since stats reset):** {format_bytes(wal_bytes)}{rate_str}")
+        else:
+            report.append("- **WAL generated:** N/A (`pg_stat_wal` unavailable — PG < 14)")
+        backend_pct = ch.get('backend_write_pct')
+        report.append(f"- **Backend (unbuffered) writes:** "
+                       f"{f'{backend_pct}%' if backend_pct is not None else 'unavailable on PG ≥ 16'}")
+        report.append(f"- **checkpoint_timeout (current):** {ch.get('checkpoint_timeout_s')}s")
+        report.append(f"- **max_wal_size (current):** {ch.get('max_wal_size_mb')} MB")
+        report.append(f"- **checkpoint_completion_target:** {ch.get('checkpoint_completion_target')}")
+        report.append("")
+
+        rec = ch.get('recommendation')
+        if rec and rec.get('needs_tuning'):
+            report.append(f"> **Tuning recommended:** {rec.get('reason')}")
+            report.append("")
+            report.append(f"- Recommended `checkpoint_timeout`: {rec.get('recommended_checkpoint_timeout_s')}s")
+            report.append(f"- Recommended `max_wal_size`: {rec.get('recommended_max_wal_size_mb')} MB")
+            report.append("")
+            report.append("```sql")
+            for stmt in rec.get('alter_system_sql', []):
+                report.append(stmt)
+            report.append("```")
+            report.append("")
+            report.append("> **Caveat:** raising `max_wal_size` means more WAL replayed on crash/"
+                           "failover recovery — a durability trade-off, reversible, no reboot "
+                           "needed (both are dynamic GUCs). The two settings are recommended "
+                           "together; raising one without the other just delays the same problem.")
+            report.append("")
+        elif rec:
+            report.append("No checkpoint/WAL tuning recommended at this time.")
+            report.append("")
+
+        report.append("---")
+        report.append("")
+
     # Global Settings
     report.append("## Global Autovacuum Settings")
     report.append("")

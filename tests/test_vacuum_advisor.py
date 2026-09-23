@@ -401,7 +401,7 @@ class TestMergedOutput:
             assert set(entry["report"].keys()) == {
                 "generated_at", "pg_version", "platform", "platform_label",
                 "platform_defaults", "settings", "xid_data", "tables",
-                "recommendations", "summary",
+                "recommendations", "checkpoint_health", "summary",
             }
 
         assert data[0]["instance"] == "prod-instance-1"
@@ -501,6 +501,89 @@ class TestPlatformInternalDatabaseExclusion:
 
         exclude = captured_exclude["value"]
         assert exclude == {"rdsadmin", "reporting_db", "staging_db"}
+
+
+class TestAllDatabasesResilience:
+    """One unreachable database (revoked CONNECT, auth mismatch, etc.)
+    shouldn't abort analysis of every other database on the instance.
+    fetch_data() raises DatabaseFetchError instead of calling sys.exit()
+    itself; --all-databases must catch it per database and keep going.
+    """
+
+    @staticmethod
+    def _fake_build_report(gsettings, raw_rows, xid_rows, pg_version, platform, current_db,
+                            checkpoint_health=None):
+        return _make_report(tables=[])
+
+    def test_skips_failing_database_and_continues_with_the_rest(self):
+        def fake_list_target_databases(conn_string, exclude=None):
+            return ["good_db", "bad_db", "good_db2"]
+
+        def fake_fetch_data(conn_string, schema, min_rows, fetch_checkpoint=True):
+            if "dbname=bad_db " in conn_string or conn_string.endswith("dbname=bad_db"):
+                raise va.DatabaseFetchError("Could not connect: simulated failure")
+            return ({}, [], [], "PostgreSQL 16", conn_string, None)
+
+        argv = [
+            "vacuum_advisor.py", "-H", "myhost", "-U", "myuser",
+            "--all-databases", "--platform", "rds", "--format", "json",
+        ]
+        import io, json as _json
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with patch.object(sys, "argv", argv), \
+             patch.object(va, "list_target_databases", side_effect=fake_list_target_databases), \
+             patch.object(va, "fetch_data", side_effect=fake_fetch_data), \
+             patch.object(va, "build_report", side_effect=self._fake_build_report), \
+             redirect_stdout(buf):
+            va.main()  # must not raise / exit — at least one database succeeded
+
+        # The buffer also contains the "skipping bad_db" warning (printed
+        # before the JSON) and the "Skipped Databases" summary panel (printed
+        # after) — both go through the same console/stdout. Parse just the
+        # JSON array itself rather than the whole buffer.
+        raw = buf.getvalue()
+        data, _ = _json.JSONDecoder().raw_decode(raw, raw.index("["))
+        dbs = [entry["database"] for entry in data]
+        assert dbs == ["good_db", "good_db2"]
+        assert "bad_db" not in dbs
+
+    def test_exits_nonzero_when_every_database_fails(self):
+        def fake_list_target_databases(conn_string, exclude=None):
+            return ["bad_db1", "bad_db2"]
+
+        def fake_fetch_data(conn_string, schema, min_rows, fetch_checkpoint=True):
+            raise va.DatabaseFetchError("simulated failure")
+
+        argv = [
+            "vacuum_advisor.py", "-H", "myhost", "-U", "myuser",
+            "--all-databases", "--platform", "rds", "--format", "json",
+        ]
+        with patch.object(sys, "argv", argv), \
+             patch.object(va, "list_target_databases", side_effect=fake_list_target_databases), \
+             patch.object(va, "fetch_data", side_effect=fake_fetch_data):
+            try:
+                va.main()
+                assert False, "expected SystemExit"
+            except SystemExit as e:
+                assert e.code == 1
+
+    def test_single_database_mode_still_exits_on_fetch_error(self):
+        """Non-multi-db runs keep the original behavior: fail fast, exit(1)."""
+        def fake_fetch_data(conn_string, schema, min_rows, fetch_checkpoint=True):
+            raise va.DatabaseFetchError("simulated failure")
+
+        argv = [
+            "vacuum_advisor.py", "-H", "myhost", "-d", "mydb", "-U", "myuser",
+            "--platform", "rds",
+        ]
+        with patch.object(sys, "argv", argv), \
+             patch.object(va, "fetch_data", side_effect=fake_fetch_data):
+            try:
+                va.main()
+                assert False, "expected SystemExit"
+            except SystemExit as e:
+                assert e.code == 1
 
 
 # ── --replay with multi-database (--all-databases) JSON ────────────────────
@@ -620,6 +703,325 @@ class TestReplayAutoDetectsShape:
                 va.main()  # must not raise
         finally:
             os.unlink(path)
+
+
+# ── Checkpoint & WAL Health ──────────────────────────────────────────────────
+
+class TestPgMajorVersion:
+    def test_two_digit_major(self):
+        assert va._pg_major_version("PostgreSQL 17.4 on x86_64-pc-linux-gnu, compiled by gcc") == 17
+
+    def test_pg16(self):
+        assert va._pg_major_version("PostgreSQL 16.1 on aarch64-unknown-linux-gnu") == 16
+
+    def test_old_two_part_version(self):
+        assert va._pg_major_version("PostgreSQL 9.6.24 on x86_64-pc-linux-gnu") == 9
+
+    def test_unparseable_raises(self):
+        try:
+            va._pg_major_version("not a postgres version string")
+            assert False, "expected ValueError"
+        except ValueError:
+            pass
+
+
+def _raw_checkpoint(
+    checkpoints_timed=2394, checkpoints_req=12306,
+    buffers_checkpoint=1_000_000, buffers_clean=500_000, buffers_backend=None,
+    block_size=8192, stats_reset=None, wal_bytes=None,
+    checkpoint_timeout_s=300, max_wal_size_mb=6144,
+    checkpoint_completion_target=0.9, pg_stat_source="pg_stat_bgwriter",
+):
+    return {
+        "pg_stat_source": pg_stat_source,
+        "checkpoints_timed": checkpoints_timed,
+        "checkpoints_req": checkpoints_req,
+        "buffers_checkpoint": buffers_checkpoint,
+        "buffers_clean": buffers_clean,
+        "buffers_backend": buffers_backend,
+        "block_size": block_size,
+        "stats_reset": stats_reset,
+        "checkpoint_write_time_ms": None,
+        "checkpoint_sync_time_ms": None,
+        "wal_bytes": wal_bytes,
+        "wal_stats_reset": stats_reset,
+        "checkpoint_timeout_s": checkpoint_timeout_s,
+        "max_wal_size_mb": max_wal_size_mb,
+        "checkpoint_completion_target": checkpoint_completion_target,
+    }
+
+
+class TestBuildCheckpointHealth:
+    def test_derives_checkpoints_req_pct_and_totals(self):
+        raw = _raw_checkpoint(checkpoints_timed=2394, checkpoints_req=12306)
+        ch = va.build_checkpoint_health(raw)
+        assert ch.checkpoints_total == 14700
+        assert ch.checkpoints_req_pct == round(100.0 * 12306 / 14700, 1)
+
+    def test_matches_customer_reported_83_7_pct(self):
+        # Real ticket 327999 numbers from the plan: 2,394 timed / 12,306 req.
+        raw = _raw_checkpoint(checkpoints_timed=2394, checkpoints_req=12306)
+        ch = va.build_checkpoint_health(raw)
+        assert ch.checkpoints_req_pct == 83.7
+        assert "CHECKPOINT_PRESSURE" in ch.statuses
+
+    def test_low_req_pct_is_ok_not_flagged(self):
+        raw = _raw_checkpoint(checkpoints_timed=9000, checkpoints_req=1000)
+        ch = va.build_checkpoint_health(raw)
+        assert ch.checkpoints_req_pct < va.CHECKPOINT_REQ_PCT_THRESHOLD
+        assert ch.statuses == ["OK"]
+
+    def test_no_checkpoints_yet_is_ok_not_a_divide_by_zero(self):
+        raw = _raw_checkpoint(checkpoints_timed=0, checkpoints_req=0)
+        ch = va.build_checkpoint_health(raw)
+        assert ch.checkpoints_total == 0
+        assert ch.checkpoints_req_pct == 0.0
+        assert ch.statuses == ["OK"]
+
+    def test_buffers_backend_none_on_pg16_plus_yields_null_backend_pct(self):
+        raw = _raw_checkpoint(buffers_backend=None)
+        ch = va.build_checkpoint_health(raw)
+        assert ch.buffers_backend is None
+        assert ch.backend_write_pct is None
+        # background_write_pct / checkpoint_write_pct still computable without it
+        assert ch.total_written_bytes == raw["block_size"] * (
+            raw["buffers_checkpoint"] + raw["buffers_clean"]
+        )
+
+    def test_buffers_backend_present_on_pre16_computes_backend_pct(self):
+        raw = _raw_checkpoint(buffers_backend=200_000)
+        ch = va.build_checkpoint_health(raw)
+        assert ch.buffers_backend == 200_000
+        assert ch.backend_write_pct is not None
+        assert ch.backend_write_pct > 0
+
+    def test_wal_bytes_per_hour_computed_from_stats_window(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 9, 22, tzinfo=timezone.utc)
+        reset = now - timedelta(hours=10)
+        raw = _raw_checkpoint(stats_reset=reset, wal_bytes=10 * 1024**3)  # 10 GiB over 10h
+        ch = va.build_checkpoint_health(raw, now=now)
+        assert ch.wal_bytes_per_hour is not None
+        assert abs(ch.wal_bytes_per_hour - 1024**3) < 1  # ~1 GiB/hour
+
+    def test_wal_bytes_none_when_pg_stat_wal_unavailable(self):
+        # PG < 14 — fetch_checkpoint_health() would set wal_bytes=None
+        raw = _raw_checkpoint(wal_bytes=None)
+        ch = va.build_checkpoint_health(raw)
+        assert ch.wal_bytes is None
+        assert ch.wal_bytes_per_hour is None
+
+    def test_recommendation_attached_automatically(self):
+        raw = _raw_checkpoint(checkpoints_timed=2394, checkpoints_req=12306)
+        ch = va.build_checkpoint_health(raw)
+        assert ch.recommendation is not None
+        assert ch.recommendation.needs_tuning is True
+
+
+class TestRecommendCheckpointTuning:
+    def _healthy_ch(self, **overrides):
+        raw = _raw_checkpoint(**overrides)
+        return va.build_checkpoint_health(raw)
+
+    def test_no_tuning_needed_below_threshold(self):
+        ch = self._healthy_ch(checkpoints_timed=9500, checkpoints_req=500)
+        rec = va.recommend_checkpoint_tuning(ch)
+        assert rec.needs_tuning is False
+        assert rec.alter_system_sql == []
+        assert rec.recommended_max_wal_size_mb == ch.max_wal_size_mb
+
+    def test_never_recommends_shrinking_max_wal_size(self):
+        # Low WAL rate relative to an already-large max_wal_size — must not
+        # shrink it back down.
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 9, 22, tzinfo=timezone.utc)
+        reset = now - timedelta(hours=24)
+        raw = _raw_checkpoint(
+            checkpoints_timed=100, checkpoints_req=900,   # 90% req -> needs tuning
+            max_wal_size_mb=40960,                          # already 40 GB
+            wal_bytes=1 * 1024**3,                           # only 1 GiB/day -> ~43 MB/hour
+            stats_reset=reset,
+        )
+        ch = va.build_checkpoint_health(raw, now=now)
+        rec = ch.recommendation
+        assert rec.needs_tuning is True
+        assert rec.recommended_max_wal_size_mb == 40960  # floored at current, not shrunk
+
+    def test_sizes_up_to_at_least_one_hour_of_wal(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 9, 22, tzinfo=timezone.utc)
+        reset = now - timedelta(hours=1)
+        raw = _raw_checkpoint(
+            checkpoints_timed=100, checkpoints_req=900,
+            max_wal_size_mb=1024,             # stock 1 GB
+            wal_bytes=53 * 1024**3,           # ~53 GiB in the last hour -> ticket 327999 rate
+            stats_reset=reset,
+        )
+        ch = va.build_checkpoint_health(raw, now=now)
+        rec = ch.recommendation
+        assert rec.needs_tuning is True
+        assert rec.recommended_max_wal_size_mb >= 53 * 1024
+
+    def test_tiered_checkpoint_timeout_scales_with_severity(self):
+        low_tier  = va.recommended_checkpoint_timeout_s(55.0)[0]
+        mid_tier  = va.recommended_checkpoint_timeout_s(75.0)[0]
+        high_tier = va.recommended_checkpoint_timeout_s(95.0)[0]
+        assert low_tier < mid_tier < high_tier
+        assert low_tier == 900
+
+    def test_alter_system_sql_recommends_timeout_and_wal_size_together(self):
+        ch = self._healthy_ch(checkpoints_timed=100, checkpoints_req=900)
+        rec = ch.recommendation
+        assert rec.needs_tuning is True
+        assert len(rec.alter_system_sql) == 2
+        assert any("checkpoint_timeout" in s for s in rec.alter_system_sql)
+        assert any("max_wal_size" in s for s in rec.alter_system_sql)
+
+    def test_max_wal_size_uses_mb_units_not_gb_suffix(self):
+        ch = self._healthy_ch(checkpoints_timed=100, checkpoints_req=900)
+        rec = ch.recommendation
+        wal_sql = next(s for s in rec.alter_system_sql if "max_wal_size" in s)
+        assert "MB" in wal_sql
+        assert "GB" not in wal_sql
+
+
+class TestCheckpointHealthJsonRoundTrip:
+    def _make_ch(self):
+        raw = _raw_checkpoint(checkpoints_timed=2394, checkpoints_req=12306)
+        return va.build_checkpoint_health(raw)
+
+    def test_report_to_dict_includes_checkpoint_health_key(self):
+        report = _make_report(tables=[])
+        report.checkpoint_health = self._make_ch()
+        data = va.report_to_dict(report)
+        assert "checkpoint_health" in data
+        assert data["checkpoint_health"]["checkpoints_req_pct"] == 83.7
+        assert data["checkpoint_health"]["recommendation"]["needs_tuning"] is True
+
+    def test_report_to_dict_checkpoint_health_null_when_unavailable(self):
+        report = _make_report(tables=[])  # checkpoint_health defaults to None
+        data = va.report_to_dict(report)
+        assert data["checkpoint_health"] is None
+
+    def test_round_trip_through_report_from_dict(self):
+        ch = self._make_ch()
+        report = _make_report(tables=[])
+        report.checkpoint_health = ch
+        data = va.report_to_dict(report)
+        # report_from_dict needs the full shape produced by report_to_dict
+        data["xid_data"] = []
+        rebuilt = va.report_from_dict(data)
+        assert rebuilt.checkpoint_health is not None
+        assert rebuilt.checkpoint_health.checkpoints_req_pct == ch.checkpoints_req_pct
+        assert rebuilt.checkpoint_health.recommendation.needs_tuning == ch.recommendation.needs_tuning
+        assert rebuilt.checkpoint_health.recommendation.alter_system_sql == ch.recommendation.alter_system_sql
+
+    def test_old_json_without_checkpoint_health_key_still_replays(self):
+        # Simulates a JSON report file produced before this feature existed.
+        data = dict(_SINGLE_DB_REPORT_DICT)
+        assert "checkpoint_health" not in data
+        report = va.report_from_dict(data)
+        assert report.checkpoint_health is None
+
+
+class TestShowCheckpointHealthDoesNotCrash:
+    def test_prints_nothing_when_checkpoint_health_is_none(self):
+        report = _make_report(tables=[])
+        import io
+        buf = io.StringIO()
+        original_console = va.console
+        va.console = va.Console(file=buf, force_terminal=False, width=200)
+        try:
+            va.show_checkpoint_health(report)
+        finally:
+            va.console = original_console
+        assert buf.getvalue() == ""
+
+    def test_prints_panel_with_recommendation_when_pressure_detected(self):
+        raw = _raw_checkpoint(checkpoints_timed=2394, checkpoints_req=12306)
+        report = _make_report(tables=[])
+        report.checkpoint_health = va.build_checkpoint_health(raw)
+
+        import io
+        buf = io.StringIO()
+        original_console = va.console
+        va.console = va.Console(file=buf, force_terminal=False, width=200)
+        try:
+            va.show_checkpoint_health(report)
+        finally:
+            va.console = original_console
+
+        printed = buf.getvalue()
+        assert "Checkpoint" in printed
+        assert "ALTER SYSTEM SET checkpoint_timeout" in printed
+        assert "ALTER SYSTEM SET max_wal_size" in printed
+
+
+class TestAllDatabasesCheckpointHealthReuse:
+    """Checkpoint/WAL stats are instance-wide (like xid_data) — --all-databases
+    must fetch them once against the instance, not once per database, and
+    attach the same built CheckpointHealth object to every database's report.
+    """
+
+    def test_fetch_checkpoint_only_requested_on_first_database(self):
+        def fake_list_target_databases(conn_string, exclude=None):
+            return ["db_a", "db_b", "db_c"]
+
+        fetch_checkpoint_flags = []
+
+        def fake_fetch_data(conn_string, schema, min_rows, fetch_checkpoint=True):
+            fetch_checkpoint_flags.append(fetch_checkpoint)
+            raw_cp = _raw_checkpoint() if fetch_checkpoint else None
+            return ({}, [], [], "PostgreSQL 16", conn_string, raw_cp)
+
+        argv = [
+            "vacuum_advisor.py", "-H", "myhost", "-U", "myuser",
+            "--all-databases", "--platform", "rds", "--format", "json",
+        ]
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with patch.object(sys, "argv", argv), \
+             patch.object(va, "list_target_databases", side_effect=fake_list_target_databases), \
+             patch.object(va, "fetch_data", side_effect=fake_fetch_data), \
+             redirect_stdout(buf):
+            va.main()
+
+        assert fetch_checkpoint_flags == [True, False, False]
+
+    def test_same_checkpoint_health_object_attached_to_every_report(self):
+        def fake_list_target_databases(conn_string, exclude=None):
+            return ["db_a", "db_b"]
+
+        def fake_fetch_data(conn_string, schema, min_rows, fetch_checkpoint=True):
+            raw_cp = _raw_checkpoint() if fetch_checkpoint else None
+            return ({}, [], [], "PostgreSQL 16", conn_string, raw_cp)
+
+        captured_reports = []
+        original_build_report = va.build_report
+
+        def spy_build_report(*args, **kwargs):
+            report = original_build_report(*args, **kwargs)
+            captured_reports.append(report)
+            return report
+
+        argv = [
+            "vacuum_advisor.py", "-H", "myhost", "-U", "myuser",
+            "--all-databases", "--platform", "rds", "--format", "json",
+        ]
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with patch.object(sys, "argv", argv), \
+             patch.object(va, "list_target_databases", side_effect=fake_list_target_databases), \
+             patch.object(va, "fetch_data", side_effect=fake_fetch_data), \
+             patch.object(va, "build_report", side_effect=spy_build_report), \
+             redirect_stdout(buf):
+            va.main()
+
+        assert len(captured_reports) == 2
+        assert captured_reports[0].checkpoint_health is not None
+        assert captured_reports[0].checkpoint_health is captured_reports[1].checkpoint_health
 
 
 if __name__ == "__main__":

@@ -64,24 +64,48 @@ it and generates the SQL, with scale factors **tiered by table size**.
   (autovacuum handles them well with defaults); tables with autovacuum disabled
   are always shown regardless of size
 - **Multi-status indicators** — a table can carry multiple flags simultaneously:
-  `🚫 DISABLED`, `⚠ HIGH BLOAT`, `⚡ NEAR VAC`, `📈 NEAR ANA`, `✓ OK`
+  `🚫 DISABLED`, `⚠ HIGH BLOAT`, `⚠ HIGH BLOAT (ABS)`, `⚡ NEAR VAC`, `📈 NEAR ANA`, `✓ OK`
+- **Bloat ranked by percentage *and* absolute volume** — `HIGH_BLOAT` (≥20% dead)
+  is percentage-only and can hide the tables that actually drive I/O: a huge table
+  can sit at a "fine" 10% dead while carrying tens of millions of dead tuples.
+  `HIGH_BLOAT_ABSOLUTE` fires independently (≥1M dead rows or ≥1GB estimated dead
+  bytes) so those tables surface too — both flags can be set at once, and the
+  original percentage-only behavior is unchanged
 - **Tiered ALTER TABLE recommendations** — scale factors sized to table row count,
-  covering both vacuum and analyze tuning in a single statement
+  covering both vacuum and analyze tuning in a single statement, with schema and
+  table identifiers always properly quoted (`quote_ident()` semantics: safe for
+  mixed-case names, reserved words, and embedded quotes — important for EF Core,
+  Hibernate, and other ORMs that create mixed-case or quoted-reserved-word tables)
 - **`autovacuum_enabled=false` detection** — critical warning panel with the exact
-  `RESET` SQL for each disabled table
+  `RESET` SQL (also properly quoted) for each disabled table
 - **XID wraparound check** — scans all databases (not just the current one);
   background context printed once with performance impact explanation (SHARE UPDATE
   EXCLUSIVE lock, freeze cost); each database gets a CRITICAL or WARNING panel with
   its % of soft limit shown inline
+- **`--all-databases`** — `pg_stat_user_tables`/`pg_class` are database-scoped, so a
+  normal run only ever sees the one database it connected to. `--all-databases`
+  enumerates every connectable database on the instance (via `pg_database`) and
+  analyzes each in turn, merging results into a `{instance, database, report}` list.
+  `template0`/`template1` and the platform's own admin database (`rdsadmin` for
+  rds/aurora, `cloudsqladmin` for cloudsql) are excluded automatically;
+  `--exclude-db` skips additional ones
 - **`--replay JSON_FILE`** — re-render the full console output from a saved JSON
   report with no database connection required; useful for reviewing what a customer
-  saw or sharing analysis with teammates
+  saw or sharing analysis with teammates. Auto-detects single-database reports
+  *and* `--all-databases` merged reports (rendering each database in turn)
 - **`json_to_report.py`** — companion script that converts a JSON report to a
   human-readable Markdown file; useful when you can't see the customer's console
   output but they can share the JSON file
 - **`--format json|csv`** — structured output for scripting, CI pipelines, and
-  monitoring; JSON includes the complete `ALTER TABLE` SQL for each recommendation
+  monitoring; JSON includes the complete `ALTER TABLE` SQL for each recommendation.
+  With `--all-databases`, JSON is the same `{instance, database, report}` list and
+  CSV flattens every database's table rows into one file tagged with `instance`/
+  `database` columns
 - **`--top N`** — show only the N worst tables by dead row count
+- **Checkpoint & WAL Health** — flags when checkpoints are firing on WAL fill
+  (`checkpoints_req`) instead of the `checkpoint_timeout` timer, and recommends
+  `checkpoint_timeout`/`max_wal_size` together as `ALTER SYSTEM` statements
+  (see [Checkpoint & WAL Health](#checkpoint--wal-health) below)
 - **Safe to run on production** — read-only session, no objects created or modified
 
 ---
@@ -99,6 +123,109 @@ pip install psycopg2-binary rich
 ```
 
 **Requirements:** Python 3.8+, PostgreSQL 12+
+
+---
+
+## Required privileges
+
+**No superuser required.** This tool only reads catalog and statistics
+views — it never creates, modifies, or deletes anything (`fetch_data()`
+runs with `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`). The
+role you connect with needs:
+
+1. **`LOGIN`** — obviously.
+2. **`CONNECT`** on every database you want analyzed. PostgreSQL grants
+   `CONNECT` on every database to `PUBLIC` by default, so any role can
+   already connect anywhere unless a DBA has explicitly revoked it on a
+   specific database — common in more locked-down environments. With
+   `--all-databases`, this means every database it enumerates.
+3. **Read access to `pg_stat_user_tables`, `pg_class`, `pg_settings`,
+   and `pg_database`.** These are globally readable by any authenticated
+   role in stock PostgreSQL — no grants needed in a default setup.
+
+Point 3 is the one thing that can vary: some hardened environments
+`REVOKE` default public read access to catalogs/stats. The safest fix,
+rather than tracking down exactly which view lost its default grant, is
+the built-in **`pg_monitor`** role (a predefined PostgreSQL role since
+PG 10 — not superuser, read-only, bundles `pg_read_all_settings` +
+`pg_read_all_stats` + `pg_stat_scan_tables`). It's supported on RDS,
+Aurora, and Cloud SQL, and covers everything this tool queries regardless
+of any hardening already in place.
+
+### Option A — use an existing role
+
+If your usual monitoring/read-only role already has `pg_monitor` (or
+broader access), nothing else to do — just point `-U` at it.
+
+### Option B — create a dedicated role just for this tool
+
+Run as the instance's admin/master user (the RDS/Aurora master user has
+`rds_superuser`, which includes `pg_monitor`; Cloud SQL's default user has
+`cloudsqlsuperuser` — both are sufficient for the grants below, no true
+superuser needed):
+
+```sql
+-- Create a dedicated, read-only role for pg-vacuum-advisor.
+CREATE ROLE pgvacadvisor WITH LOGIN PASSWORD 'change-me' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+
+-- pg_monitor: built-in, read-only, no write access anywhere — covers every
+-- catalog/stats view this tool queries even if public read access has been
+-- revoked on this instance.
+GRANT pg_monitor TO pgvacadvisor;
+
+-- Explicit CONNECT — belt-and-suspenders in case PUBLIC's default CONNECT
+-- has been revoked on this specific database.
+GRANT CONNECT ON DATABASE mydb TO pgvacadvisor;
+```
+
+For `--all-databases`, grant `CONNECT` on every database in one shot
+instead of listing them by hand:
+
+```sql
+DO $$
+DECLARE
+    db RECORD;
+BEGIN
+    FOR db IN
+        SELECT datname FROM pg_database
+        WHERE datistemplate = false AND datallowconn = true
+    LOOP
+        EXECUTE format('GRANT CONNECT ON DATABASE %I TO pgvacadvisor', db.datname);
+    END LOOP;
+END $$;
+```
+
+Run it:
+
+```bash
+PGPASSWORD='change-me' python3 vacuum_advisor.py -H myhost -U pgvacadvisor \
+    --platform rds --all-databases --format json --output report.json
+```
+
+### Cleaning up afterward
+
+```sql
+-- Revoke CONNECT on every database (mirrors the DO block above)
+DO $$
+DECLARE
+    db RECORD;
+BEGIN
+    FOR db IN
+        SELECT datname FROM pg_database
+        WHERE datistemplate = false AND datallowconn = true
+    LOOP
+        EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM pgvacadvisor', db.datname);
+    END LOOP;
+END $$;
+
+DROP ROLE pgvacadvisor;
+```
+
+`DROP ROLE` fails if the role owns any objects or has active connections —
+it won't, since this role is only ever used to read, but if you hit that
+error anyway, terminate its sessions first
+(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'pgvacadvisor';`)
+and retry.
 
 ---
 
@@ -148,6 +275,48 @@ python3 vacuum_advisor.py -H myhost -d mydb -U postgres --platform rds --min-row
 python3 vacuum_advisor.py -H myhost -d mydb -U postgres --platform rds --top 20
 ```
 
+### Analyzing every database on an instance
+
+`pg_stat_user_tables` and `pg_class` are database-scoped — a normal run only
+ever sees the one database it connected to. `--all-databases` loops over
+every connectable database on the instance instead:
+
+```bash
+# Console: renders each database in turn, with a divider panel
+python3 vacuum_advisor.py -H myhost -U postgres --platform rds --all-databases
+
+# JSON: {instance, database, report} list — one report per database
+python3 vacuum_advisor.py -H myhost -U postgres --platform rds --all-databases \
+    --format json --output all_dbs_report.json
+
+# CSV: every database's table rows flattened into one file, tagged by instance/database
+python3 vacuum_advisor.py -H myhost -U postgres --platform rds --all-databases \
+    --format csv --output all_dbs_tables.csv
+
+# Skip additional databases beyond the automatic exclusions (template0/template1,
+# and the platform's own admin database — rdsadmin / cloudsqladmin)
+python3 vacuum_advisor.py -H myhost -U postgres --platform rds --all-databases \
+    --exclude-db staging_db,reporting_db
+
+# Tag the "instance" field in the merged output (default: the -H/--host value) —
+# useful when you'll merge results from several instances afterward
+python3 vacuum_advisor.py -H myhost -U postgres --platform rds --all-databases \
+    --instance-label prod-cluster-1
+```
+
+Requires `-H`/`--host` (not `--conn`), since a separate connection string is
+built for each database found. It connects once to `--bootstrap-db` (default:
+`postgres`) purely to enumerate databases via `pg_database`, then reconnects
+per database to run the actual analysis. XID wraparound data is cluster-wide
+regardless, so it comes out identical across every entry either way.
+
+If the role can't connect to one particular database (revoked `CONNECT`, an
+auth mismatch, anything that fails the connection or a query — see
+[Required privileges](#required-privileges)), that database is skipped with a
+warning and a final "Skipped Databases" panel listing what and why — the rest
+of the run continues normally. It only exits non-zero if *every* database
+failed.
+
 ### Output formats
 
 ```bash
@@ -174,6 +343,12 @@ console output exactly as they would have seen it:
 ```bash
 python3 vacuum_advisor.py --replay report.json
 ```
+
+`--replay` auto-detects the shape of the file: a plain single-database report
+renders as above; a `--all-databases` merged report (a JSON list of
+`{instance, database, report}` entries) renders each database in turn, each
+preceded by an `Instance: X   Database: Y` header panel — no separate flag
+needed, and both shapes work with the same command.
 
 ### Converting JSON to Markdown
 
@@ -217,9 +392,13 @@ python3 vacuum_advisor.py --help
 | `--schema` | all | Restrict analysis to one schema |
 | `--min-rows N` | 0 | Only report tables with ≥ N live rows |
 | `--top N` | all | Show only top N tables by dead row count |
+| `--all-databases` | off | Analyze every connectable database on the instance (requires `-H`, not `--conn`) — see [Analyzing every database on an instance](#analyzing-every-database-on-an-instance) |
+| `--bootstrap-db DB` | `postgres` | Database used only to enumerate other databases with `--all-databases` |
+| `--exclude-db DB1,DB2,...` | — | Additional databases to skip with `--all-databases`, on top of the automatic exclusions (`template0`/`template1`, platform admin db) |
+| `--instance-label NAME` | `-H` value | Label recorded as `"instance"` in `--all-databases` output |
 | `--format` | `console` | `console` / `json` / `csv` |
 | `--output FILE` | stdout | Write json/csv output to a file |
-| `--replay FILE` | — | Re-render console output from a JSON report (no DB connection needed) |
+| `--replay FILE` | — | Re-render console output from a JSON report (no DB connection needed); auto-detects single-database vs. `--all-databases` merged reports |
 | `--version` | — | Print version and exit |
 
 ---
@@ -328,9 +507,14 @@ a combined status flag.
 | `⚡ NEAR VAC` | Dead rows ≥ 80% of the vacuum trigger threshold |
 | `📈 NEAR ANA` | Modified rows ≥ 80% of the analyze trigger threshold |
 | `⚠ HIGH BLOAT` | Dead-tuple percentage ≥ 20% |
+| `⚠ HIGH BLOAT (ABS)` | Absolute dead-row count ≥ 1M **or** estimated dead bytes ≥ 1GB — fires independently of dead-tuple percentage, so a huge table with a "fine" percentage but massive absolute volume still gets surfaced |
 | `🚫 DISABLED` | `autovacuum_enabled = false` is set on this table |
 
-A table can carry multiple flags at once (e.g. `🚫 DISABLED` + `⚠ HIGH BLOAT`).
+A table can carry multiple flags at once (e.g. `🚫 DISABLED` + `⚠ HIGH BLOAT` +
+`⚠ HIGH BLOAT (ABS)`). The two `HIGH BLOAT` flags are independent: a 400 GB
+table at 12% dead can trip `HIGH BLOAT (ABS)` (its ~48 GB of estimated dead
+bytes is well past the 1GB bar) while sitting well under the 20% `HIGH BLOAT`
+percentage threshold — that's exactly the case this flag exists to catch.
 
 ### 5 — Per-Table Tuning Recommendations (only shown when relevant)
 
@@ -402,16 +586,58 @@ schedule, not that the database is about to shut down.
 ### 7 — Summary
 
 ```
-╭──────────────────────────────╮
-│ Summary                      │
-│                              │
-│   Tables analyzed        : 9 │
-│   Autovacuum disabled    : 1 │
-│   High bloat (≥20% dead) : 0 │
-│   Never autovacuumed     : 2 │
-│   Need per-table tuning  : 1 │
-╰──────────────────────────────╯
+╭────────────────────────────────────────────────────────────────╮
+│ Summary                                                         │
+│                                                                  │
+│   Tables analyzed        : 9                                    │
+│   Autovacuum disabled    : 1                                    │
+│   High bloat (≥20% dead) : 0                                    │
+│   High bloat (absolute)  : 1  (≥1,000,000 dead rows or           │
+│                                ≥1.0 GB est. dead bytes)          │
+│   Never autovacuumed     : 2                                    │
+│   Need per-table tuning  : 1                                    │
+╰────────────────────────────────────────────────────────────────╯
 ```
+
+### 8 — Multi-database output (`--all-databases`, only shown when used)
+
+Console mode prints a divider panel before each database's full report:
+
+```
+╭─────────────────────────────────╮
+│ Database: IntegrationsService   │
+╰─────────────────────────────────╯
+
+[... full report for this database, same sections as above ...]
+
+╭─────────────────────────────────╮
+│ Database: CodeScanOrchestrator  │
+╰─────────────────────────────────╯
+
+[... full report for this database ...]
+```
+
+`--format json` produces a list instead of a single report object — one entry
+per database, each carrying the same `report` shape a single-database run
+would have produced on its own:
+
+```json
+[
+  {
+    "instance": "myhost",
+    "database": "IntegrationsService",
+    "report": { "generated_at": "...", "pg_version": "...", "tables": [...], "summary": {...} }
+  },
+  {
+    "instance": "myhost",
+    "database": "CodeScanOrchestrator",
+    "report": { "...": "..." }
+  }
+]
+```
+
+`--format csv` flattens every database's table rows into one file, with
+`instance` and `database` columns prepended to each row.
 
 ---
 
@@ -439,6 +665,81 @@ SELECT schemaname, relname, n_live_tup, n_dead_tup, last_autovacuum, last_autoan
 FROM   pg_stat_user_tables
 ORDER  BY n_dead_tup DESC;
 ```
+
+---
+
+## Checkpoint & WAL Health
+
+A checkpoint fires one of two ways: on the `checkpoint_timeout` timer, or the
+moment WAL written since the last checkpoint approaches `max_wal_size`
+(tracked as `checkpoints_req` — "requested"). When checkpoints are mostly
+`checkpoints_req` rather than `checkpoints_timed`, it means WAL is filling
+faster than the timer would otherwise trigger a checkpoint — usually because
+`max_wal_size` (and often `checkpoint_timeout`) are undersized for the
+current write rate.
+
+This tool computes `checkpoints_req_pct` from `pg_stat_bgwriter` (PG ≤ 16) or
+`pg_stat_checkpointer` (PG ≥ 17, which split checkpointer-specific counters
+out of `pg_stat_bgwriter`), combines it with the WAL generation rate from
+`pg_stat_wal` (PG ≥ 14), and flags `CHECKPOINT_PRESSURE` once requested
+checkpoints reach **50%** of the total. Above that bar, it recommends raising
+`checkpoint_timeout` and `max_wal_size` **together** — raising one without the
+other just delays the same problem — sized per the rule from
+[postgresqlco.nf's annotated `max_wal_size` docs](https://postgresqlco.nf/doc/en/param/max_wal_size/18/):
+below roughly 1 GB/hour of sustained WAL, PostgreSQL's stock default is fine;
+above that, size `max_wal_size` to at least one hour of WAL at the current
+rate (never smaller than what's already configured).
+
+```
+╭─ Checkpoint & WAL Health ──────────────────────────────────────────╮
+│ ⚠ 83.7% of checkpoints are requested (WAL-triggered), not timed     │
+│                                                                      │
+│   Checkpoints (since 2026-08-16)  : 14,700 (2,394 timed / 12,306 req)│
+│   Avg time between checkpoints    : 3.4 min                         │
+│   WAL generated                   : 43.7 TiB  (~53 GiB/hour avg)    │
+│   checkpoint_timeout (current)    : 300s                            │
+│   max_wal_size (current)          : 6144 MB                         │
+│                                                                      │
+│   Recommended (raise together):                                     │
+│     checkpoint_timeout = 1200s                                      │
+│     max_wal_size       = 54272 MB   [≥ 1 hour of WAL at current     │
+│                                       rate — sized from the          │
+│                                       pg_stat_wal average]           │
+│                                                                      │
+│   ALTER SYSTEM SET checkpoint_timeout = '1200s';                    │
+│   ALTER SYSTEM SET max_wal_size = '54272MB';                         │
+│                                                                      │
+│   Caveat: more WAL between checkpoints means longer crash/failover  │
+│   recovery — a conscious durability trade, reversible, no reboot    │
+│   needed (both are dynamic GUCs).                                   │
+╰──────────────────────────────────────────────────────────────────────╯
+```
+
+Notes:
+
+- **Instance-wide, not per-table.** These stats aren't scoped to a database,
+  so with `--all-databases` this is fetched once per instance and the same
+  result is attached to every database's report (and shown once, not once
+  per database, in console/`--replay` output) — the same pattern already
+  used for XID wraparound data.
+- **`backend_write_pct` is `null` on PG ≥ 16** — `buffers_backend` was removed
+  from `pg_stat_bgwriter` in PG 16 and folded into `pg_stat_io`, which this
+  tool doesn't query yet. Everything else (the checkpoint-vs-timer
+  percentage, the WAL rate, and the recommendation) is unaffected.
+- **RDS auto-configures `max_wal_size` from allocated storage** on PG 16+
+  (e.g. 6 GB for ≥100 GB of allocated storage) — this tool always reads the
+  *live* value via `pg_settings`, not the parameter-group API, so it already
+  reflects that auto-configuration correctly. A large `max_wal_size` on RDS
+  is not by itself evidence someone manually overrode it, so there's no
+  ★-style "differs from platform default" flag for this setting.
+- **CSV export doesn't include this section** — it's cluster-level, not
+  per-table, so there's no natural row to attach it to. JSON and console
+  output are the only places it appears; `checkpoint_health` is a top-level
+  JSON key (`null` when the underlying stats couldn't be read at all —
+  permissions issue, very old PG — rather than the key being omitted).
+- Older JSON reports made before this feature still `--replay` fine —
+  `checkpoint_health` is optional and simply omitted from the console output
+  when absent.
 
 ---
 

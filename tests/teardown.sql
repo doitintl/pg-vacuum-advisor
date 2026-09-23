@@ -12,10 +12,13 @@
 DROP SCHEMA IF EXISTS vac_test CASCADE;
 
 -- pgbench tables (only if you ran pgbench -i)
-DROP TABLE IF EXISTS public.pgbench_events   CASCADE;
-DROP TABLE IF EXISTS public.pgbench_history  CASCADE;
-DROP TABLE IF EXISTS public.pgbench_accounts CASCADE;
-DROP TABLE IF EXISTS public.pgbench_tellers  CASCADE;
-DROP TABLE IF EXISTS public.pgbench_branches CASCADE;
+DROP TABLE IF EXISTS public.pgbench_events    CASCADE;
+DROP TABLE IF EXISTS public.pgbench_history   CASCADE;
+DROP TABLE IF EXISTS public.pgbench_accounts  CASCADE;
+DROP TABLE IF EXISTS public.pgbench_tellers   CASCADE;
+DROP TABLE IF EXISTS public.pgbench_branches  CASCADE;
+DROP TABLE IF EXISTS public.pgbench_wal_heavy CASCADE;
 
-\echo 'Done.'
+\echo 'Done. (This does not touch checkpoint/bgwriter/wal stats or any extra'
+\echo 'test databases created for --all-databases testing — see'
+\echo 'tests/run_checkpoint_tests.sh for how those are cleaned up.)'

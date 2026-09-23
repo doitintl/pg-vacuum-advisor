@@ -51,3 +51,10 @@ pgpass
 .coverage
 htmlcov/
 .tox/
+
+CHECKPOINT_HEALTH_PLAN.md
+global-bundle.pem
+tests/checkpoint_setup.sql
+tests/pgbench_wal_heavy.sql
+tests/pgbench_wal_heavy_setup.sql
+tests/run_checkpoint_tests.sh
